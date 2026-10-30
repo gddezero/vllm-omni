@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from collections.abc import Callable
+import itertools
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +14,7 @@ from torch.distributed.fsdp import (
     MixedPrecisionPolicy,
     fully_shard,
 )
+from torch.distributed.tensor import DTensor
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.parallel_state import get_world_group
@@ -28,6 +30,57 @@ def _unshardable_parameters(model: nn.Module) -> set[nn.Parameter]:
         for param in model.parameters()
         if param.ndim == 0 or not (param.is_floating_point() or param.is_complex())
     }
+
+
+def _move_tensor_in_place(tensor: torch.Tensor, device: torch.device) -> None:
+    """Move a parameter or buffer to ``device`` keeping the same Python object.
+
+    ``tensor.data = ...`` needs shallow-copy compatible tensor types, which an
+    out-of-tree device tensor and its CPU source may not have (e.g. TPU). Swap
+    the tensors instead in that case, as ``nn.Module._apply`` does with
+    ``swap_module_params_on_conversion``.
+    """
+    with torch.no_grad():
+        moved = tensor.to(device)
+    if torch._has_compatible_shallow_copy_type(tensor, moved):
+        tensor.data = moved
+        return
+    if isinstance(tensor, nn.Parameter):
+        moved = nn.Parameter(moved, requires_grad=tensor.requires_grad)
+    torch.utils.swap_tensors(tensor, moved)
+
+
+def _fsdp_device(mesh: DeviceMesh) -> torch.device:
+    """The device fully_shard moves module states to (mirrors FSDP2)."""
+    if mesh.device_type == "cpu":
+        return torch.device("cpu")
+    return torch.device(mesh.device_type, torch.get_device_module(mesh.device_type).current_device())
+
+
+def _place_states_fsdp_cannot_move(
+    module: nn.Module, mesh: DeviceMesh | None, ignored: Iterable[torch.Tensor] = ()
+) -> None:
+    """Pre-place states that fully_shard would fail to move to the mesh device.
+
+    FSDP2 moves plain tensors with ``tensor.data = tensor.to(device)``, which
+    raises when the device tensor type is not shallow-copy compatible with the
+    source. Move only those tensors here; compatible ones (CUDA, CPU) are left
+    to FSDP unchanged.
+    """
+    if mesh is None:
+        return
+    device = _fsdp_device(mesh)
+    skip = set(ignored)
+    probes: dict[tuple[torch.device, torch.dtype], bool] = {}
+    for tensor in itertools.chain(module.parameters(), module.buffers()):
+        if tensor in skip or tensor.device == device or tensor.device.type == "meta" or isinstance(tensor, DTensor):
+            continue
+        key = (tensor.device, tensor.dtype)
+        if key not in probes:
+            probe = torch.empty(0, dtype=tensor.dtype, device=device)
+            probes[key] = torch._has_compatible_shallow_copy_type(tensor, probe)
+        if not probes[key]:
+            _move_tensor_in_place(tensor, device)
 
 
 @dataclass
@@ -256,7 +309,7 @@ def prepare_hsdp_shard_context(
             )
         for param in unshardable_params:
             if param.device != target_device:
-                param.data = param.data.to(target_device)
+                _move_tensor_in_place(param, target_device)
         ignored_params.update(unshardable_params)
         logger.info(
             "HSDP excluding %d unshardable parameter tensors from sharding "
@@ -285,6 +338,7 @@ def shard_hsdp_module(module: nn.Module, context: HSDPShardContext) -> None:
         module_ignored_params = context.ignored_params.intersection(module.parameters())
         if module_ignored_params:
             module_kwargs["ignored_params"] = module_ignored_params
+    _place_states_fsdp_cannot_move(module, module_kwargs.get("mesh"), module_kwargs.get("ignored_params") or ())
     fully_shard(module, **module_kwargs)
     for param in module.parameters():
         param.requires_grad = False
@@ -295,6 +349,7 @@ def finalize_hsdp_root(model: nn.Module, context: HSDPShardContext) -> None:
     root_kwargs = dict(context.hsdp_kwargs)
     if context.ignored_params:
         root_kwargs["ignored_params"] = context.ignored_params
+    _place_states_fsdp_cannot_move(model, root_kwargs.get("mesh"), root_kwargs.get("ignored_params") or ())
     fully_shard(model, **root_kwargs)
     for param in model.parameters():
         param.requires_grad = False
