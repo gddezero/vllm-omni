@@ -126,6 +126,10 @@ class FastVideoVSABackend(AttentionBackend):
 
     @classmethod
     def validate_available(cls) -> None:
+        from vllm_omni.diffusion.attention.ops.block_sparse import _platform_block_sparse_kernel
+
+        if any(_platform_block_sparse_kernel(size, torch.bfloat16, 128) is not None for size in (64, 128)):
+            return  # the platform provider supplies the kernel
         if all(importlib.util.find_spec(name) is None for name in ("fastvideo_kernel", "flashinfer", "cudnn")):
             raise ImportError(
                 "FASTVIDEO_VSA requires the optional fastvideo-kernel package "
@@ -175,16 +179,22 @@ class FastVideoVSAImpl(AttentionImpl):
 
         self.provider = backend_kwargs.get("provider", "auto")
         self.precision = backend_kwargs.get("precision", "bf16")
-        if self.provider not in ("auto", "fastvideo", "flashinfer", "cudnn", "triton") or self.precision not in (
-            "bf16",
-            "sage",
-        ):
-            raise ValueError("VSA requires provider auto/fastvideo/flashinfer/cudnn/triton and precision bf16/sage")
-        if self.provider in ("cudnn", "triton") and not self._supports_tile64_provider:
+        if self.provider not in (
+            "auto",
+            "fastvideo",
+            "flashinfer",
+            "cudnn",
+            "triton",
+            "platform",
+        ) or self.precision not in ("bf16", "sage"):
+            raise ValueError(
+                "VSA requires provider auto/fastvideo/flashinfer/cudnn/triton/platform and precision bf16/sage"
+            )
+        if self.provider in ("cudnn", "triton", "platform") and not self._supports_tile64_provider:
             raise ValueError(f"{self.provider} VSA requires an implementation with explicit block routing")
         if self.provider == "auto" and not self._supports_tile64_provider:
             self.provider = "fastvideo"
-        if self.precision == "sage" and self.provider in ("fastvideo", "cudnn", "triton"):
+        if self.precision == "sage" and self.provider in ("fastvideo", "cudnn", "triton", "platform"):
             raise ValueError("Sage VSA requires the FlashInfer provider")
         if self.provider == "flashinfer":
             from vllm_omni.diffusion.attention.ops.flashinfer_block_sparse import require_flashinfer_sparse
