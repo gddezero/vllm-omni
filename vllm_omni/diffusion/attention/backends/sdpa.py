@@ -376,6 +376,16 @@ class SDPAImpl(AttentionImpl):
     ) -> torch.Tensor:
         return self._forward_impl(query, key, value, attn_metadata, mask_mode="broadcast_k")
 
+    def forward_oot(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        # Plain torch SDPA: no platform kernels involved.
+        return self._forward_impl(query, key, value, attn_metadata, mask_mode="broadcast_k")
+
     def forward_hip(
         self,
         query: torch.Tensor,

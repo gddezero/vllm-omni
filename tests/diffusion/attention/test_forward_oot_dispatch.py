@@ -32,9 +32,6 @@ class _Platform:
     def is_out_of_tree(self):
         return self.kind == "oot"
 
-    def __repr__(self):
-        return f"_Platform({self.kind})"
-
 
 class _Impl(AttentionImpl):
     def __init__(self):
@@ -65,7 +62,9 @@ def test_forward_dispatches_out_of_tree_platforms_to_forward_oot(monkeypatch, ki
 def test_default_forward_oot_raises_with_implementation_name(monkeypatch):
     monkeypatch.setattr(abstract, "current_omni_platform", _Platform("oot"))
     x = torch.zeros(1)
-    with pytest.raises(NotImplementedError, match="_CudaOnlyImpl has no forward implementation for out-of-tree"):
+    with pytest.raises(
+        NotImplementedError, match="_CudaOnlyImpl has no forward implementation for out-of-tree platform _Platform"
+    ):
         _CudaOnlyImpl().forward(x, x, x)
 
 
@@ -74,3 +73,16 @@ def test_unknown_platform_still_raises(monkeypatch):
     x = torch.zeros(1)
     with pytest.raises(NotImplementedError, match="No forward implementation for platform"):
         _Impl().forward(x, x, x)
+
+
+def test_sdpa_impl_runs_on_out_of_tree_platforms(monkeypatch):
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+
+    monkeypatch.setattr(abstract, "current_omni_platform", _Platform("oot"))
+    impl = SDPAImpl(num_heads=2, head_size=8, softmax_scale=8**-0.5, causal=False)
+    q, k, v = (torch.randn(1, 5, 2, 8) for _ in range(3))
+    out = impl.forward(q, k, v)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), scale=8**-0.5
+    ).transpose(1, 2)
+    torch.testing.assert_close(out, expected)

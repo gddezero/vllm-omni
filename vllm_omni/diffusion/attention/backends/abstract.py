@@ -463,5 +463,6 @@ class AttentionImpl(ABC, Generic[T]):
         # Out-of-tree platforms (registered through vllm_omni.platform_plugins)
         # opt in per implementation; CUDA kernels are not assumed to work there.
         raise NotImplementedError(
-            f"{type(self).__name__} has no forward implementation for out-of-tree platform {current_omni_platform}"
+            f"{type(self).__name__} has no forward implementation for out-of-tree platform "
+            f"{type(current_omni_platform).__name__}"
         )
