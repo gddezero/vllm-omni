@@ -138,7 +138,10 @@ class OmniPlatform(Platform):
         [blocks]`` (valid rows per tile). Query rows of block ``i`` attend to the
         first ``block_sizes[j]`` keys of every block ``j`` with
         ``block_map[b, h, i, j]``; rows with no selected block return zeros.
-        It returns a tensor shaped like ``query``.
+        It returns a tensor shaped like ``query``. The callable should be an
+        opaque op to tracing (e.g. a registered torch custom op with a fake
+        implementation), as the CUDA providers are. The lookup is cached per
+        process.
         """
         return None
 

@@ -160,6 +160,12 @@ fastvideo_block_sparse_attn_bshd = torch.ops.vllm_omni.fastvideo_block_sparse_at
 
 
 @functools.lru_cache(maxsize=32)
+def _platform_block_sparse_kernel(block_size: int, dtype: torch.dtype, head_size: int):
+    """The platform's block-sparse kernel for this tile/dtype/head size, or None (looked up once)."""
+    return current_omni_platform.get_diffusion_block_sparse_attn(block_size, dtype, head_size)
+
+
+@functools.lru_cache(maxsize=32)
 def resolve_block_sparse_provider(
     provider: str, precision: str, device: torch.device, dtype: torch.dtype, head_size: int, block_size: int = 64
 ) -> str:
@@ -172,18 +178,26 @@ def resolve_block_sparse_provider(
     """
     if block_size not in (64, 128):
         raise ValueError("block_size must be 64 or 128")
-    if provider in ("auto", "platform"):
-        # A platform kernel (e.g. an out-of-tree TPU kernel) takes precedence
-        # over the CUDA providers below; platforms without one return None.
-        if current_omni_platform.get_diffusion_block_sparse_attn(block_size, dtype, head_size) is not None:
-            if precision != "bf16":
-                raise ValueError("The platform block-sparse provider requires BF16 precision")
-            return "platform"
-        if provider == "platform":
+    if provider == "platform":
+        if _platform_block_sparse_kernel(block_size, dtype, head_size) is None:
             raise ValueError(
                 f"{type(current_omni_platform).__name__} provides no block-sparse attention kernel for "
                 f"block_size={block_size}, dtype={dtype}, head_size={head_size}"
             )
+        if precision != "bf16":
+            raise ValueError("The platform block-sparse provider requires BF16 precision")
+        return provider
+    if provider == "auto" and precision == "bf16":
+        # A platform kernel (e.g. an out-of-tree TPU kernel) takes precedence
+        # over the CUDA providers below; platforms without one return None.
+        # Other precisions (sage) keep the CUDA selection.
+        if _platform_block_sparse_kernel(block_size, dtype, head_size) is not None:
+            logger.info_once(
+                "Using the %s block-sparse attention kernel for tile%d VSA",
+                type(current_omni_platform).__name__,
+                block_size,
+            )
+            return "platform"
     if provider == "triton":
         from .triton_block_sparse import require_triton_sparse
 
@@ -314,10 +328,22 @@ def block_sparse_attn_bshd(
     if block_size not in (64, 128):
         raise ValueError("block_size must be 64 or 128")
     if provider == "platform":
-        kernel = current_omni_platform.get_diffusion_block_sparse_attn(block_size, query.dtype, query.shape[-1])
-        if kernel is None or precision != "bf16":
-            raise ValueError("The platform block-sparse provider needs a platform kernel and BF16 precision")
-        return kernel(query, key, value, block_map, block_sizes, softmax_scale, block_size=block_size)
+        if precision != "bf16":
+            raise ValueError("The platform block-sparse provider requires BF16 precision")
+        kernel = _platform_block_sparse_kernel(block_size, query.dtype, query.shape[-1])
+        if kernel is None:
+            raise ValueError(
+                f"{type(current_omni_platform).__name__} provides no block-sparse attention kernel for "
+                f"block_size={block_size}, dtype={query.dtype}, head_size={query.shape[-1]}"
+            )
+        if query.ndim != 4 or query.shape != key.shape or query.shape != value.shape or query.shape[1] % block_size:
+            raise ValueError("The platform block-sparse kernel requires matching BSHD inputs padded to whole tiles")
+        blocks = query.shape[1] // block_size
+        if block_map.shape != (query.shape[0], query.shape[2], blocks, blocks) or block_map.dtype != torch.bool:
+            raise ValueError("The platform block-sparse kernel requires a boolean [B,H,blocks,blocks] block_map")
+        if block_sizes is None or block_sizes.shape != (blocks,):
+            raise ValueError("The platform block-sparse kernel requires one size per tile")
+        return kernel(query, key, value, block_map, block_sizes.to(torch.int32), softmax_scale, block_size=block_size)
     if provider == "triton":
         from .triton_block_sparse import triton_block_sparse_attention
 

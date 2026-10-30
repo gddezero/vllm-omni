@@ -196,6 +196,11 @@ into two FlashInfer compute blocks on SM120/SM121. Pooling, top-k and region
 budgets remain logical tile128. Explicit provider selection is validated before
 loading the Omni model; an unavailable provider never falls back to dense attention.
 
+When the current platform supplies its own block-sparse kernel
+(`OmniPlatform.get_diffusion_block_sparse_attn`, e.g. an out-of-tree platform
+plugin), BF16 `auto` selects that kernel before the CUDA providers above; `sage`
+precision keeps the CUDA selection.
+
 For native tile64 or tile128 through the public cuDNN BSA API, install
 `uv pip install -e '.[cudnn-bsa]'` and set:
 
@@ -241,7 +246,7 @@ either `diffusion_attention_config.default` or a `per_role` entry alongside
 [H3 AdaLN offload](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md#default-adaln-weight-offload)
 for its separate SM120 default and overrides.
 
-Set `fastvideo_vsa_provider` to `fastvideo`, `flashinfer`, `cudnn`, or `triton` to choose a fixed
-provider. Explicit FlashInfer selection requires compatible hardware and
+Set `fastvideo_vsa_provider` to `fastvideo`, `flashinfer`, `cudnn`, `triton`, or `platform` to choose
+a fixed provider (`platform` is the current platform's own kernel, BF16 only). Explicit FlashInfer selection requires compatible hardware and
 installed kernels. Logs show the selected provider and precision. GPU testing
 covers SM120; SM121 BF16 support follows the upstream kernel requirements.

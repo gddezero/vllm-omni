@@ -126,6 +126,10 @@ class FastVideoVSABackend(AttentionBackend):
 
     @classmethod
     def validate_available(cls) -> None:
+        from vllm_omni.diffusion.attention.ops.block_sparse import _platform_block_sparse_kernel
+
+        if any(_platform_block_sparse_kernel(size, torch.bfloat16, 128) is not None for size in (64, 128)):
+            return  # the platform provider supplies the kernel
         if all(importlib.util.find_spec(name) is None for name in ("fastvideo_kernel", "flashinfer", "cudnn")):
             raise ImportError(
                 "FASTVIDEO_VSA requires the optional fastvideo-kernel package "
