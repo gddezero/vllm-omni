@@ -119,10 +119,11 @@ class FastVideoVSABackend(AttentionBackend):
         # FastVideo accepts variable-sized edge blocks. This lets packed
         # [real, pad] inputs run on their valid prefix without materializing an
         # attention mask; the implementation restores the ignored pad rows.
-        # Only forward_cuda honours packed_padding: every other platform hands
+        # forward_cuda and forward_oot honour packed_padding (forward_oot via
+        # the H3 routing or the packed-aware SDPA fallback). NPU/XPU/MUSA hand
         # the tensors straight to SDPA, which reads attn_mask and nothing else,
         # so the pad rows would be attended as real keys.
-        return current_omni_platform.is_cuda()
+        return current_omni_platform.is_cuda() or current_omni_platform.is_out_of_tree()
 
     @classmethod
     def validate_available(cls) -> None:
@@ -439,6 +440,17 @@ class FastVideoVSAImpl(AttentionImpl):
             return self._fallback(
                 original_query, original_key, original_value, attn_metadata, f"VSA kernel failed: {exc}"
             )
+
+    def forward_oot(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        # The FastVideo VSA kernel is CUDA only. Dense SDPA, honouring packed
+        # padding, as forward_cuda does when the kernel is unavailable.
+        return self._fallback(query, key, value, attn_metadata, "the FastVideo VSA kernel is CUDA only")
 
     def forward_npu(
         self,
