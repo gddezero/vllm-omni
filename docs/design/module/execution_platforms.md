@@ -46,6 +46,11 @@ External platforms use `Operator.register_oot(Implementation)` before model
 construction and implement `forward_oot`. Overrides preserve the operator's
 constructor, parameters, and outputs; `forward_native` is the default fallback.
 
+Diffusion attention impls (`AttentionImpl`) dispatch an out-of-tree platform to
+`forward_oot` as well, but there is no native fallback: the default raises, and
+each impl opts in (`SDPAImpl` runs plain torch SDPA there). A platform selects
+which backend, and so which impl, runs through `get_diffusion_attn_backend_cls`.
+
 ## Candidate invariants
 
 ### PLATFORM-INV-001: Capabilities are explicit
