@@ -163,18 +163,36 @@ def test_forward_restores_packed_padding_rows(oot_platform):
     assert not output[:, 904:].any()
 
 
-def test_out_of_tree_without_layout_metadata_does_not_fall_back(oot_platform):
-    oot_platform(_masked_reference_kernel([]))
-    q = torch.randn(1, 37, 2, 8, dtype=torch.bfloat16)
-    sparse = AttentionMetadata(extra={"vsa_h3_tile_size": 128})
+def _sdpa(q, k, v):
+    out = torch.nn.functional.scaled_dot_product_attention(
+        *(x.transpose(1, 2).float() for x in (q, k, v)), scale=8**-0.5
+    )
+    return out.transpose(1, 2).to(q.dtype)
+
+
+def test_missing_layout_raises_when_sparse_and_degrades_to_sdpa_otherwise(monkeypatch, oot_platform):
+    from vllm_omni.diffusion.attention.backends import sdpa
+
+    platform = oot_platform(_masked_reference_kernel([]))
+    monkeypatch.setattr(sdpa, "current_omni_platform", platform, raising=False)
+    torch.manual_seed(1)
+    q, k, v = (torch.randn(1, 37, 2, 8, dtype=torch.bfloat16) for _ in range(3))
     with pytest.raises(ValueError, match="complete packed video layout"):
-        _impl().forward(q, q, q, sparse)
-    with pytest.raises(NotImplementedError, match="out-of-tree"):
-        _impl().forward(q, q, q, None)
+        _impl().forward(q, k, v, AttentionMetadata(extra={"vsa_h3_tile_size": 128}))
+    # Same as CUDA without H3 layout metadata (e.g. warmup): dense SDPA, which
+    # runs in BF16 there while the reference upcasts.
+    torch.testing.assert_close(_impl().forward(q, k, v, None), _sdpa(q, k, v), atol=2e-3, rtol=2e-2)
 
 
-def test_packed_mask_free_follows_the_platform_kernel(oot_platform):
-    oot_platform(_masked_reference_kernel([]))
-    assert fastvideo_vsa.FastVideoVSABackend.supports_packed_mask_free()
+def test_missing_platform_kernel_raises_for_sparse_requests(oot_platform):
     oot_platform(None)
-    assert not fastvideo_vsa.FastVideoVSABackend.supports_packed_mask_free()
+    q = torch.randn(1, 904, 2, 8, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="needs the platform block-sparse kernel for tile128"):
+        _impl().forward(q, q, q, _omni_metadata())
+
+
+def test_packed_mask_free_on_out_of_tree_platforms(oot_platform):
+    # forward_oot honours packed padding with or without a platform kernel
+    # (H3 routing, or the packed-aware SDPA fallback).
+    oot_platform(None)
+    assert fastvideo_vsa.FastVideoVSABackend.supports_packed_mask_free()

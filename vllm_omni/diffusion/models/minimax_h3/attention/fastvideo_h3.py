@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import math
+from collections.abc import Callable
 
 import torch
 from vllm.logger import init_logger
@@ -16,6 +17,7 @@ from vllm_omni.diffusion.attention.backends.fastvideo_vsa import (
     _get_gate_compress,
 )
 from vllm_omni.diffusion.attention.ops.block_sparse import (
+    _platform_block_sparse_kernel,
     block_sparse_attn_bshd,
     build_prefix_dense_block_map,
     mean_pool_tiles,
@@ -26,6 +28,7 @@ from vllm_omni.diffusion.attention.ops.video_tiles import (
     get_non_pad_index,
     get_tile_partition_indices,
 )
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -285,9 +288,10 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         # The H3 routing is device agnostic; the block-sparse kernel comes from
-        # the platform provider. Without H3 layout metadata there is no routed
-        # path, and the generic VSA kernel is CUDA only.
-        return self._forward_routed(query, key, value, attn_metadata, super().forward_oot)
+        # the platform provider. Without H3 layout metadata, or without a
+        # platform kernel, this degrades like the generic VSA forward_oot (dense
+        # SDPA) unless the request requires sparse attention.
+        return self._forward_routed(query, key, value, attn_metadata, super().forward_oot, platform_only=True)
 
     def _forward_routed(
         self,
@@ -295,7 +299,9 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
-        unrouted_forward,
+        unrouted_forward: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, AttentionMetadata | None], torch.Tensor],
+        *,
+        platform_only: bool = False,
     ) -> torch.Tensor:
         requires_tile128 = attn_metadata is not None and attn_metadata.extra.get("vsa_h3_tile_size", 64) == 128
         requires_sparse = requires_tile128 or (
@@ -306,13 +312,26 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
                 raise ValueError("FastH3 requires complete packed video layout metadata")
             return unrouted_forward(query, key, value, attn_metadata)
 
+        block_size = 128 if requires_tile128 else 64
+        if platform_only and (
+            self.provider not in ("auto", "platform")
+            or _platform_block_sparse_kernel(block_size, query.dtype, self.head_size) is None
+        ):
+            # Off CUDA only the platform's own kernel can run the routed path.
+            if requires_sparse:
+                raise ValueError(
+                    f"FastH3 sparse attention on {type(current_omni_platform).__name__} needs the platform "
+                    f"block-sparse kernel for tile{block_size}/{query.dtype}/head_size={self.head_size} "
+                    f"(provider {self.provider!r})"
+                )
+            return unrouted_forward(query, key, value, attn_metadata)
         provider = resolve_block_sparse_provider(
             self.provider,
             self.precision,
             query.device,
             query.dtype,
             self.head_size,
-            block_size=128 if requires_tile128 else 64,
+            block_size=block_size,
         )
         original_query, original_key, original_value = query, key, value
         original_seq_len = query.shape[1]
