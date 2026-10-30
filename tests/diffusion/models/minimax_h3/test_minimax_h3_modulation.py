@@ -218,3 +218,62 @@ def test_fused_modulation_keeps_fp32_affine_intermediates(fused_gate: bool) -> N
     # and rounds down to 1.2265625. Premature BF16 rounding drops the epsilon
     # and instead rounds the tie up to 1.234375, changing every output row.
     assert torch.equal(actual, torch.full_like(x, 1.2265625))
+
+
+def _fp32_kernel_reference(x, residual, branch, weight, shift, scale, gate, indices, eps):
+    """The Triton kernels' contract: FP32 math, one rounding to the output dtype."""
+    dtype = x.dtype
+    s, sh, g = (t.index_select(0, indices).float() for t in (scale, shift, gate))
+
+    def rms(v):
+        return v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps) * weight.float()
+
+    residual_out = (residual.float() + g * branch.float()).to(dtype)
+    return {
+        "scale_shift": (x.float() * (1.0 + s) + sh).to(dtype),
+        "gate": (x.float() + g * branch.float()).to(dtype),
+        "rms": (rms(x.float()) * (1.0 + s) + sh).to(dtype),
+        "residual": residual_out,
+        "modulated": (rms(residual_out.float()) * (1.0 + s) + sh).to(dtype),
+    }
+
+
+def _run_wrappers(x, residual, branch, weight, shift, scale, gate, indices, eps):
+    residual_out, modulated = indexed_gate_rms_norm_scale_shift(
+        residual, gate, branch, weight, shift, scale, indices, eps
+    )
+    return {
+        "scale_shift": indexed_scale_shift_(x.clone(), shift, scale, indices),
+        "gate": indexed_gate(x, gate, branch, indices),
+        "rms": rms_norm_indexed_scale_shift(x, weight, shift, scale, indices, eps),
+        "residual": residual_out,
+        "modulated": modulated,
+    }
+
+
+@pytest.mark.cpu
+def test_native_path_matches_triton_numerics_on_out_of_tree_platforms(monkeypatch):
+    import vllm_omni.diffusion.layers.indexed_modulation as mod
+
+    torch.manual_seed(3)
+    rows, hidden_size, conditions, eps = 37, 3072, 5, 1e-6
+    x, residual, branch = (torch.randn(rows, hidden_size, dtype=torch.bfloat16) for _ in range(3))
+    weight = torch.randn(hidden_size, dtype=torch.bfloat16)
+    shift, scale, gate = (torch.randn(conditions, hidden_size, dtype=torch.bfloat16) for _ in range(3))
+    indices = torch.arange(rows) % conditions
+    args = (x, residual, branch, weight, shift, scale, gate, indices, eps)
+    expected = _fp32_kernel_reference(*args)
+
+    monkeypatch.setattr(mod, "_use_native", lambda: True)
+    actual = _run_wrappers(*args)
+    for name, value in expected.items():
+        assert actual[name].dtype == value.dtype, name
+        assert torch.equal(actual[name], value), name
+    # The fused kernel normalizes the BF16-rounded residual it returns.
+    assert torch.equal(actual["modulated"], rms_norm_indexed_scale_shift(actual["residual"], weight, shift, scale, indices, eps))
+
+    # Control: the CPU branch rounds the normalized value before the affine
+    # transform, so the comparison above can tell the two numerics apart.
+    monkeypatch.setattr(mod, "_use_native", lambda: False)
+    legacy = _run_wrappers(*args)
+    assert not torch.equal(legacy["rms"], expected["rms"])
