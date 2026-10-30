@@ -49,6 +49,18 @@ _VAE_ENCODE_LEGACY_PREP_ENV = "VLLM_OMNI_VAE_ENCODE_LEGACY_PREP"
 logger = init_logger(__name__)
 
 
+def _seed_accelerators(devices: list[torch.device], seed: int) -> None:
+    """Seed each device's generator, generic over accelerator types.
+
+    The current device is switched with torch.accelerator.device_index:
+    torch_tpu forbids its device-module context (torch.tpu.device) outside
+    torch.
+    """
+    for device in devices:
+        with torch.accelerator.device_index(device.index):
+            torch.get_device_module(device.type).manual_seed(seed)
+
+
 @contextmanager
 def _minimax_h3_keyframe_encode_context(
     device: torch.device,
@@ -773,9 +785,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 ),
             ):
                 torch.default_generator.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
-                for device in devices:
-                    with self.device_module.device(device):
-                        self.device_module.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
+                _seed_accelerators(devices, MINIMAX_H3_KEYFRAME_ENCODE_SEED)
                 with _minimax_h3_keyframe_encode_context(parameter.device):
                     latent = self.model.encode_images(
                         image,
@@ -942,9 +952,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         try:
             with tiling_context, torch.random.fork_rng(devices=devices, device_type=parameter.device.type):
                 torch.default_generator.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
-                for device in devices:
-                    with self.device_module.device(device):
-                        self.device_module.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
+                _seed_accelerators(devices, MINIMAX_H3_KEYFRAME_ENCODE_SEED)
                 prepared = None
                 if isinstance(frames, np.ndarray) and not _legacy_encode_prep_enabled():
                     prepared = self._stream_prepare_video_tensor(frames, parameter.device)

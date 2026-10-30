@@ -2356,6 +2356,88 @@ def test_keyframe_encode_enters_backend_context(monkeypatch, fail_encode):
     assert video_vae.model.parallel_tiling
 
 
+def test_keyframe_encode_seeds_accelerator_without_device_module_context(monkeypatch):
+    # torch_tpu forbids torch.tpu.device(...) outside torch; the per-device seed
+    # must go through torch.accelerator.device_index instead.
+    from PIL import Image
+
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    seeded, indices, inside = [], [], []
+
+    class StrictDeviceModule:
+        @staticmethod
+        def device(device):
+            raise RuntimeError("device context is internal to the backend")
+
+        @staticmethod
+        def manual_seed(seed):
+            seeded.append((seed, bool(inside)))
+
+    @contextmanager
+    def device_index(index):
+        indices.append(index)
+        inside.append(index)
+        try:
+            yield
+        finally:
+            inside.pop()
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1, device="meta"))
+            self.parallel_tiling = False
+
+        def encode_images(self, image, *, use_fp16_latent):
+            return [torch.ones(1, 1, 2, 2)]
+
+    video_vae = object.__new__(vae_module.MiniMaxH3VideoVAE)
+    torch.nn.Module.__init__(video_vae)
+    video_vae.model = FakeModel()
+    video_vae.config_dict = {"latent_channels": 1, "latents_mean": [0.0], "latents_std": [1.0]}
+    monkeypatch.setattr(torch, "get_device_module", lambda device_type=None: StrictDeviceModule)
+    monkeypatch.setattr(vae_module, "_minimax_h3_keyframe_encode_context", lambda device: nullcontext())
+    monkeypatch.setattr(torch.random, "fork_rng", lambda **kwargs: nullcontext())
+    monkeypatch.setattr(torch.accelerator, "device_index", device_index)
+
+    rows = video_vae.encode_image(Image.new("RGB", (32, 32)))
+
+    torch.testing.assert_close(rows, torch.ones(1, 4))
+    assert seeded == [(vae_module.MINIMAX_H3_KEYFRAME_ENCODE_SEED, True)]
+    assert indices == [None]  # the meta device carries no index
+
+
+def test_seed_accelerators_seeds_each_device_inside_its_index_context(monkeypatch):
+    # Shared by the keyframe and video encode paths.
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    events = []
+
+    @contextmanager
+    def device_index(index):
+        events.append(("enter", index))
+        yield
+        events.append(("exit", index))
+
+    def get_device_module(device_type=None):
+        return SimpleNamespace(manual_seed=lambda seed: events.append(("seed", device_type, seed)))
+
+    monkeypatch.setattr(torch.accelerator, "device_index", device_index)
+    monkeypatch.setattr(torch, "get_device_module", get_device_module)
+    devices = [SimpleNamespace(type="tpu", index=1), SimpleNamespace(type="tpu", index=3)]
+    vae_module._seed_accelerators(devices, 42)
+
+    assert events == [
+        ("enter", 1),
+        ("seed", "tpu", 42),
+        ("exit", 1),
+        ("enter", 3),
+        ("seed", "tpu", 42),
+        ("exit", 3),
+    ]
+
+
 def test_video_vae_can_load_on_cpu_for_staged_gpu_residency(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
 
