@@ -119,10 +119,17 @@ class FastVideoVSABackend(AttentionBackend):
         # FastVideo accepts variable-sized edge blocks. This lets packed
         # [real, pad] inputs run on their valid prefix without materializing an
         # attention mask; the implementation restores the ignored pad rows.
-        # Only forward_cuda honours packed_padding: every other platform hands
-        # the tensors straight to SDPA, which reads attn_mask and nothing else,
-        # so the pad rows would be attended as real keys.
-        return current_omni_platform.is_cuda()
+        # forward_cuda honours packed_padding, and so does the H3 forward_oot
+        # on a platform that supplies its own block-sparse kernel. Every other
+        # platform hands the tensors straight to SDPA, which reads attn_mask
+        # and nothing else, so the pad rows would be attended as real keys.
+        if current_omni_platform.is_cuda():
+            return True
+        if not current_omni_platform.is_out_of_tree():
+            return False
+        from vllm_omni.diffusion.attention.ops.block_sparse import _platform_block_sparse_kernel
+
+        return any(_platform_block_sparse_kernel(size, torch.bfloat16, 128) is not None for size in (64, 128))
 
     @classmethod
     def validate_available(cls) -> None:

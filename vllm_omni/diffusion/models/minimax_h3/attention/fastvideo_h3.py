@@ -275,6 +275,28 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        return self._forward_routed(query, key, value, attn_metadata, super().forward_cuda)
+
+    def forward_oot(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        # The H3 routing is device agnostic; the block-sparse kernel comes from
+        # the platform provider. Without H3 layout metadata there is no routed
+        # path, and the generic VSA kernel is CUDA only.
+        return self._forward_routed(query, key, value, attn_metadata, super().forward_oot)
+
+    def _forward_routed(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+        unrouted_forward,
+    ) -> torch.Tensor:
         requires_tile128 = attn_metadata is not None and attn_metadata.extra.get("vsa_h3_tile_size", 64) == 128
         requires_sparse = requires_tile128 or (
             attn_metadata is not None and attn_metadata.extra.get("vsa_h3_sparsity") is not None
@@ -282,7 +304,7 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
         if _get_h3_layout(attn_metadata) is None:
             if requires_sparse:
                 raise ValueError("FastH3 requires complete packed video layout metadata")
-            return super().forward_cuda(query, key, value, attn_metadata)
+            return unrouted_forward(query, key, value, attn_metadata)
 
         provider = resolve_block_sparse_provider(
             self.provider,
