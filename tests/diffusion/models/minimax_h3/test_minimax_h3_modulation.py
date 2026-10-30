@@ -221,20 +221,21 @@ def test_fused_modulation_keeps_fp32_affine_intermediates(fused_gate: bool) -> N
 
 
 def _fp32_kernel_reference(x, residual, branch, weight, shift, scale, gate, indices, eps):
-    """The Triton kernels' contract: FP32 math, one rounding to the output dtype."""
+    """The Triton kernels' formulas: FP32 math, one rounding to the output dtype,
+    and the fused kernel's BF16 rounding of the updated residual."""
     dtype = x.dtype
     s, sh, g = (t.index_select(0, indices).float() for t in (scale, shift, gate))
 
     def rms(v):
         return v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps) * weight.float()
 
-    residual_out = (residual.float() + g * branch.float()).to(dtype)
+    updated = (residual.float() + g * branch.float()).to(torch.bfloat16)
     return {
         "scale_shift": (x.float() * (1.0 + s) + sh).to(dtype),
         "gate": (x.float() + g * branch.float()).to(dtype),
         "rms": (rms(x.float()) * (1.0 + s) + sh).to(dtype),
-        "residual": residual_out,
-        "modulated": (rms(residual_out.float()) * (1.0 + s) + sh).to(dtype),
+        "residual": updated.to(dtype),
+        "modulated": (rms(updated.float()) * (1.0 + s) + sh).to(dtype),
     }
 
 
@@ -251,29 +252,61 @@ def _run_wrappers(x, residual, branch, weight, shift, scale, gate, indices, eps)
     }
 
 
+def _modulation_inputs(dtype, seed=3):
+    torch.manual_seed(seed)
+    rows, hidden_size, conditions = 37, 3072, 5
+    x, residual, branch = (torch.randn(rows, hidden_size, dtype=dtype) for _ in range(3))
+    weight = torch.randn(hidden_size, dtype=dtype)
+    shift, scale, gate = (torch.randn(conditions, hidden_size, dtype=dtype) for _ in range(3))
+    indices = torch.arange(rows) % conditions
+    return (x, residual, branch, weight, shift, scale, gate, indices, 1e-6)
+
+
 @pytest.mark.cpu
-def test_native_path_matches_triton_numerics_on_out_of_tree_platforms(monkeypatch):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_native_path_follows_the_kernel_formulas(monkeypatch, dtype):
+    """Pins the native path to the kernel formulas (not compared against Triton
+    itself here: that needs a GPU)."""
     import vllm_omni.diffusion.layers.indexed_modulation as mod
 
-    torch.manual_seed(3)
-    rows, hidden_size, conditions, eps = 37, 3072, 5, 1e-6
-    x, residual, branch = (torch.randn(rows, hidden_size, dtype=torch.bfloat16) for _ in range(3))
-    weight = torch.randn(hidden_size, dtype=torch.bfloat16)
-    shift, scale, gate = (torch.randn(conditions, hidden_size, dtype=torch.bfloat16) for _ in range(3))
-    indices = torch.arange(rows) % conditions
-    args = (x, residual, branch, weight, shift, scale, gate, indices, eps)
+    args = _modulation_inputs(dtype)
+    weight, shift, scale, indices, eps = args[3], args[4], args[5], args[7], args[8]
     expected = _fp32_kernel_reference(*args)
 
-    monkeypatch.setattr(mod, "_use_native", lambda: True)
+    monkeypatch.setattr(mod, "_use_native", lambda x: True)
     actual = _run_wrappers(*args)
     for name, value in expected.items():
         assert actual[name].dtype == value.dtype, name
         assert torch.equal(actual[name], value), name
     # The fused kernel normalizes the BF16-rounded residual it returns.
-    assert torch.equal(actual["modulated"], rms_norm_indexed_scale_shift(actual["residual"], weight, shift, scale, indices, eps))
+    assert torch.equal(
+        actual["modulated"], rms_norm_indexed_scale_shift(actual["residual"], weight, shift, scale, indices, eps)
+    )
 
-    # Control: the CPU branch rounds the normalized value before the affine
-    # transform, so the comparison above can tell the two numerics apart.
-    monkeypatch.setattr(mod, "_use_native", lambda: False)
-    legacy = _run_wrappers(*args)
-    assert not torch.equal(legacy["rms"], expected["rms"])
+    if dtype == torch.bfloat16:
+        # Control: the CPU branch rounds the normalized value before the affine
+        # transform, so the comparison above can tell the two numerics apart.
+        monkeypatch.setattr(mod, "_use_native", lambda x: False)
+        legacy = _run_wrappers(*args)
+        assert not torch.equal(legacy["rms"], expected["rms"])
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("device_type", "has_triton", "expected"),
+    [
+        ("cpu", True, False),  # CPU keeps its own branch
+        ("cuda", True, False),
+        ("npu", True, False),
+        ("tpu", True, True),  # out-of-tree device without a Triton backend
+        ("cuda", False, True),
+    ],
+)
+def test_use_native_only_where_triton_cannot_launch(monkeypatch, device_type, has_triton, expected):
+    import types
+
+    import vllm_omni.diffusion.layers.indexed_modulation as mod
+
+    monkeypatch.setattr(mod, "HAS_TRITON", has_triton)
+    tensor = types.SimpleNamespace(is_cpu=device_type == "cpu", device=types.SimpleNamespace(type=device_type))
+    assert mod._use_native(tensor) is expected
