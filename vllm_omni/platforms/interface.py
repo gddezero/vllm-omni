@@ -122,6 +122,27 @@ class OmniPlatform(Platform):
         return None
 
     @classmethod
+    def get_diffusion_block_sparse_attn(
+        cls,
+        block_size: int,
+        dtype: torch.dtype,
+        head_size: int,
+    ) -> Callable[..., torch.Tensor] | None:
+        """Return this platform's explicit block-sparse attention kernel, if any.
+
+        Used by the ``platform`` VSA provider (and by ``auto`` when it returns a
+        kernel). The kernel is called as
+        ``fn(query, key, value, block_map, block_sizes, softmax_scale, block_size=...)``
+        with tile-padded BSHD tensors ``[B, blocks * block_size, H, D]``, a
+        boolean ``block_map [B, H, blocks, blocks]`` and int32 ``block_sizes
+        [blocks]`` (valid rows per tile). Query rows of block ``i`` attend to the
+        first ``block_sizes[j]`` keys of every block ``j`` with
+        ``block_map[b, h, i, j]``; rows with no selected block return zeros.
+        It returns a tensor shaped like ``query``.
+        """
+        return None
+
+    @classmethod
     def get_diffusion_attn_backend_cls(
         cls,
         selected_backend: str | None,

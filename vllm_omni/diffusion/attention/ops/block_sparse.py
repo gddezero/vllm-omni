@@ -172,6 +172,18 @@ def resolve_block_sparse_provider(
     """
     if block_size not in (64, 128):
         raise ValueError("block_size must be 64 or 128")
+    if provider in ("auto", "platform"):
+        # A platform kernel (e.g. an out-of-tree TPU kernel) takes precedence
+        # over the CUDA providers below; platforms without one return None.
+        if current_omni_platform.get_diffusion_block_sparse_attn(block_size, dtype, head_size) is not None:
+            if precision != "bf16":
+                raise ValueError("The platform block-sparse provider requires BF16 precision")
+            return "platform"
+        if provider == "platform":
+            raise ValueError(
+                f"{type(current_omni_platform).__name__} provides no block-sparse attention kernel for "
+                f"block_size={block_size}, dtype={dtype}, head_size={head_size}"
+            )
     if provider == "triton":
         from .triton_block_sparse import require_triton_sparse
 
@@ -301,6 +313,11 @@ def block_sparse_attn_bshd(
     """
     if block_size not in (64, 128):
         raise ValueError("block_size must be 64 or 128")
+    if provider == "platform":
+        kernel = current_omni_platform.get_diffusion_block_sparse_attn(block_size, query.dtype, query.shape[-1])
+        if kernel is None or precision != "bf16":
+            raise ValueError("The platform block-sparse provider needs a platform kernel and BF16 precision")
+        return kernel(query, key, value, block_map, block_sizes, softmax_scale, block_size=block_size)
     if provider == "triton":
         from .triton_block_sparse import triton_block_sparse_attention
 
