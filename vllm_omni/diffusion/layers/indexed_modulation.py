@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import torch
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 
 # Ascend CANN limits the launch coreDim to uint16.
 _MAX_1D_GRID_SIZE = 65535
@@ -173,6 +173,32 @@ def _indexed_gate_rms_norm_scale_shift_kernel(
     )
 
 
+# Device types whose Triton backend launches the kernels below.
+_TRITON_DEVICE_TYPES = frozenset({"cuda", "npu", "xpu", "musa"})
+
+
+def _use_native(x: torch.Tensor) -> bool:
+    """Off-CPU devices without a Triton backend (e.g. TPU via an out-of-tree platform)."""
+    return not x.is_cpu and (not HAS_TRITON or x.device.type not in _TRITON_DEVICE_TYPES)
+
+
+# Native equivalents of the Triton kernels for devices without Triton. They keep
+# the kernels' formulas and rounding points: FP32 throughout, one rounding to
+# the output dtype, and the fused kernel's BF16 rounding of the updated residual
+# before its RMSNorm. (The CPU branches round the normalized value before the
+# affine transform and are kept as they are.) The affine parameters are cast on
+# the [conditions, hidden] tables before the row gather, which gives the same
+# values with smaller temporaries.
+def _native_affine(
+    x_float: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, indices: torch.Tensor
+) -> torch.Tensor:
+    return x_float * (1.0 + scale.float()).index_select(0, indices) + shift.float().index_select(0, indices)
+
+
+def _native_rms_norm(x_float: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    return x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + eps) * weight.float()
+
+
 def indexed_scale_shift_(
     x: torch.Tensor,
     shift: torch.Tensor,
@@ -180,6 +206,9 @@ def indexed_scale_shift_(
     indices: torch.Tensor,
 ) -> torch.Tensor:
     """Apply indexed scale/shift in-place to a disposable contiguous input."""
+    if _use_native(x):
+        x.copy_(_native_affine(x.float(), shift, scale, indices))
+        return x
     if x.is_cpu:
         x.copy_((x * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)).to(x.dtype))
         return x
@@ -213,6 +242,8 @@ def indexed_gate(
     indices: torch.Tensor,
 ) -> torch.Tensor:
     """Return ``x + gate[indices] * other`` without indexed temporaries."""
+    if _use_native(x):
+        return (x.float() + gate.float().index_select(0, indices) * other.float()).to(x.dtype)
     if x.is_cpu:
         return (x + gate.index_select(0, indices) * other).to(x.dtype)
     output = torch.empty_like(x)
@@ -249,6 +280,8 @@ def rms_norm_indexed_scale_shift(
     eps: float,
 ) -> torch.Tensor:
     """Fuse RMSNorm with an indexed affine transform."""
+    if _use_native(x):
+        return _native_affine(_native_rms_norm(x.float(), weight, eps), shift, scale, indices).to(x.dtype)
     if x.is_cpu:
         input_dtype = x.dtype
         normalized = x.float()
@@ -292,6 +325,11 @@ def indexed_gate_rms_norm_scale_shift(
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse gated residual, the following RMSNorm, and AdaLN affine."""
+    if _use_native(residual):
+        # The kernel rounds the updated residual to BF16 whatever the dtype.
+        updated = (residual.float() + gate.float().index_select(0, indices) * branch.float()).to(torch.bfloat16)
+        modulated_out = _native_affine(_native_rms_norm(updated.float(), weight, eps), shift, scale, indices)
+        return updated.to(residual.dtype), modulated_out.to(residual.dtype)
     if residual.is_cpu:
         input_dtype = residual.dtype
         residual_out = (residual + gate.index_select(0, indices) * branch).to(input_dtype)
