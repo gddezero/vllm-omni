@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import functools
+import itertools
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -13,6 +15,8 @@ from torch.distributed.fsdp import (
     MixedPrecisionPolicy,
     fully_shard,
 )
+from torch.distributed.tensor import DTensor
+from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.parallel_state import get_world_group
@@ -28,6 +32,73 @@ def _unshardable_parameters(model: nn.Module) -> set[nn.Parameter]:
         for param in model.parameters()
         if param.ndim == 0 or not (param.is_floating_point() or param.is_complex())
     }
+
+
+def _parameter_like(template: nn.Parameter, tensor: torch.Tensor) -> nn.Parameter:
+    """A Parameter of the template's class and metadata wrapping ``tensor``."""
+    if type(template) is nn.Parameter:
+        replacement = nn.Parameter(tensor, requires_grad=template.requires_grad)
+    else:
+        replacement = template.__class__.__new__(template.__class__, tensor)
+        replacement.requires_grad_(template.requires_grad)
+    replacement.__dict__.update(getattr(template, "__dict__", {}))
+    return replacement
+
+
+def _move_tensor_in_place(tensor: torch.Tensor, device: torch.device) -> None:
+    """Move a parameter or buffer to ``device`` keeping the same Python object.
+
+    ``tensor.data = ...`` needs shallow-copy compatible tensor types, which an
+    out-of-tree device tensor and its CPU source may not have (e.g. TPU). Swap
+    the tensors in that case, and always for traceable wrapper subclasses, as
+    FSDP2 and ``nn.Module._apply`` do. The swap keeps the Parameter class and
+    its attributes (e.g. ``weight_loader``).
+    """
+    with torch.no_grad():
+        moved = tensor.to(device)
+    if torch._has_compatible_shallow_copy_type(tensor, moved) and not is_traceable_wrapper_subclass(tensor):
+        tensor.data = moved
+        return
+    if isinstance(tensor, nn.Parameter):
+        moved = _parameter_like(tensor, moved)
+    torch.utils.swap_tensors(tensor, moved)
+
+
+@functools.cache
+def _fsdp_cannot_move_from_cpu(device_type: str) -> bool:
+    """Whether FSDP2's ``tensor.data = tensor.to(device)`` fails for CPU tensors."""
+    probe = torch.empty(0)
+    return not torch._has_compatible_shallow_copy_type(probe, probe.to(device_type))
+
+
+def _place_states_fsdp_cannot_move(
+    module: nn.Module, mesh: DeviceMesh | None, ignored_params: set[nn.Parameter] | None = None
+) -> None:
+    """Pre-place the states fully_shard(module) would fail to move.
+
+    FSDP2 moves plain parameters and buffers with ``tensor.data =
+    tensor.to(device)``, which raises when the device tensor type is not
+    shallow-copy compatible with the host one. On such devices, move the same
+    states FSDP2 manages to the device it targets (its own helpers decide
+    both), keeping Parameter identity. Other devices return immediately.
+    """
+    if mesh is None or not _fsdp_cannot_move_from_cpu(mesh.device_type):
+        return
+    # Private FSDP2 helpers, so the selection and target device match what
+    # fully_shard does; only reached on devices that need this. The device is
+    # resolved inside torch, where out-of-tree backends allow current_device.
+    from torch.distributed.fsdp._fully_shard._fsdp_init import (
+        _get_device_from_mesh,
+        _get_managed_modules,
+        _get_managed_states,
+    )
+
+    device = _get_device_from_mesh(mesh)
+    params, buffers = _get_managed_states(_get_managed_modules((module,), ignored_params), ignored_params)
+    for tensor in itertools.chain(params, buffers):
+        if tensor.device == device or tensor.device.type == "meta" or isinstance(tensor, DTensor):
+            continue
+        _move_tensor_in_place(tensor, device)
 
 
 @dataclass
@@ -232,7 +303,12 @@ def prepare_hsdp_shard_context(
         if has_meta_tensor:
             sub_mod.to_empty(device=target_device)
         else:
-            sub_mod.to(target_device)
+            # Not sub_mod.to(): on devices whose tensors are not shallow-copy
+            # compatible with CPU it replaces Parameters, breaking ties and
+            # dropping loader metadata.
+            for tensor in itertools.chain(sub_mod.parameters(), sub_mod.buffers()):
+                if tensor.device != target_device:
+                    _move_tensor_in_place(tensor, target_device)
         ignored_params.update(sub_mod.parameters())
     if ignored_params:
         logger.info(
@@ -256,7 +332,7 @@ def prepare_hsdp_shard_context(
             )
         for param in unshardable_params:
             if param.device != target_device:
-                param.data = param.data.to(target_device)
+                _move_tensor_in_place(param, target_device)
         ignored_params.update(unshardable_params)
         logger.info(
             "HSDP excluding %d unshardable parameter tensors from sharding "
@@ -285,6 +361,7 @@ def shard_hsdp_module(module: nn.Module, context: HSDPShardContext) -> None:
         module_ignored_params = context.ignored_params.intersection(module.parameters())
         if module_ignored_params:
             module_kwargs["ignored_params"] = module_ignored_params
+    _place_states_fsdp_cannot_move(module, module_kwargs.get("mesh"), module_kwargs.get("ignored_params"))
     fully_shard(module, **module_kwargs)
     for param in module.parameters():
         param.requires_grad = False
@@ -295,6 +372,7 @@ def finalize_hsdp_root(model: nn.Module, context: HSDPShardContext) -> None:
     root_kwargs = dict(context.hsdp_kwargs)
     if context.ignored_params:
         root_kwargs["ignored_params"] = context.ignored_params
+    _place_states_fsdp_cannot_move(model, root_kwargs.get("mesh"), root_kwargs.get("ignored_params"))
     fully_shard(model, **root_kwargs)
     for param in model.parameters():
         param.requires_grad = False

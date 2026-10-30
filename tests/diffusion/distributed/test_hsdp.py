@@ -430,3 +430,77 @@ def test_pre_sharded_load_restores_checkpoint_values(cpu_process_group, tmp_path
             assert isinstance(actual, DTensor)
             torch.testing.assert_close(actual.to_local(), expected)
     torch.testing.assert_close(model.transformer.scratch, torch.tensor([7.0]))
+
+
+# CPU and meta tensors are not shallow-copy compatible, like a CPU tensor and an
+# out-of-tree device tensor (e.g. TPU), so meta stands in for such a device here.
+class _LoaderParameter(nn.Parameter):
+    pass
+
+
+def test_move_tensor_in_place_swaps_incompatible_tensor_types():
+    param = _LoaderParameter(torch.ones(2, 2), requires_grad=False)
+    param.weight_loader = "loader"
+    buffer = torch.zeros(3)
+    with pytest.raises(RuntimeError, match="incompatible tensor type"):
+        nn.Parameter(torch.ones(2)).data = torch.ones(2, device="meta")
+
+    hsdp_module._move_tensor_in_place(param, torch.device("meta"))
+    hsdp_module._move_tensor_in_place(buffer, torch.device("meta"))
+
+    assert type(param) is _LoaderParameter and param.weight_loader == "loader"
+    assert param.device.type == "meta" and not param.requires_grad
+    assert buffer.device.type == "meta"
+
+
+class _TiedModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a = nn.Linear(2, 2)
+        self.b = nn.Linear(2, 2)
+        self.b.weight = self.a.weight
+        self.ignored = nn.Linear(2, 2)
+        self.register_buffer("scale", torch.ones(2))
+
+
+@pytest.fixture
+def meta_mesh(monkeypatch):
+    """A mesh whose device FSDP2's .data assignment cannot reach from CPU."""
+    from torch.distributed.fsdp._fully_shard import _fsdp_init
+
+    monkeypatch.setattr(_fsdp_init, "_get_device_from_mesh", lambda mesh: torch.device("meta"))
+    return SimpleNamespace(device_type="meta")
+
+
+def test_place_states_moves_fsdp_managed_states_keeping_ties(meta_mesh):
+    model = _TiedModel()
+    tied = model.a.weight
+    hsdp_module._place_states_fsdp_cannot_move(model, meta_mesh, set(model.ignored.parameters()))
+
+    assert model.a.weight is tied and model.b.weight is tied and tied.device.type == "meta"
+    assert {t.device.type for t in (model.a.bias, model.b.bias, model.scale)} == {"meta"}
+    assert {p.device.type for p in model.ignored.parameters()} == {"cpu"}
+
+
+def test_place_states_is_a_no_op_where_fsdp_can_move(monkeypatch):
+    from torch.distributed.fsdp._fully_shard import _fsdp_init
+
+    monkeypatch.setattr(_fsdp_init, "_get_managed_modules", lambda *args: pytest.fail("consulted"))
+    model = _TiedModel()
+    hsdp_module._place_states_fsdp_cannot_move(model, SimpleNamespace(device_type="cpu"))
+    assert {t.device.type for t in (*model.parameters(), *model.buffers())} == {"cpu"}
+
+
+def test_shard_places_incompatible_states_before_fully_shard(monkeypatch, meta_mesh):
+    seen = []
+    monkeypatch.setattr(
+        hsdp_module, "fully_shard", lambda module, **kwargs: seen.append({p.device.type for p in module.parameters()})
+    )
+    model = _TiedModel()
+    context = hsdp_module.HSDPShardContext(
+        hsdp_kwargs={"reshard_after_forward": True, "mesh": meta_mesh, "mp_policy": None},
+        ignored_params=set(model.ignored.parameters()),
+    )
+    shard_model(model, hsdp_shard_conditions=[lambda name, m: name == "a"], context=context)
+    assert seen == [{"meta"}, {"meta", "cpu"}]  # block "a", then the root with the ignored module
+    assert {p.device.type for p in model.ignored.parameters()} == {"cpu"}
