@@ -465,10 +465,34 @@ def test_sequential_offload_keeps_hsdp_dit_resident(monkeypatch: pytest.MonkeyPa
 
     dit_hook = HookRegistry.get_or_create(dit).get_hook(SequentialOffloadHook._HOOK_NAME)
     encoder_hook = HookRegistry.get_or_create(encoder).get_hook(SequentialOffloadHook._HOOK_NAME)
-    assert offloaded == []
+    # The DiT stays on the device; the stage starts on the host because no
+    # DiT hook will evict it before its first use.
+    assert offloaded == [encoder]
     assert dit_hook.offload_targets == [encoder] and not dit_hook.offload_after_context
     assert encoder_hook.offload_targets == [] and encoder_hook.offload_after_context
     remove_sequential_offload([dit, encoder])
+
+
+def test_sequential_offload_hsdp_stages_evict_each_other(monkeypatch: pytest.MonkeyPatch) -> None:
+    dit = _create_simple_module()
+    text_encoder = _create_simple_module()
+    vae = _create_simple_module()
+    monkeypatch.setattr(SequentialOffloadHook, "_to_cpu", lambda self, module: None)
+
+    apply_sequential_offload(
+        dit_modules=[dit],
+        encoder_modules=[text_encoder, vae],
+        device=torch.device("cpu"),
+        use_hsdp=True,
+    )
+
+    def targets(module: nn.Module) -> list[nn.Module]:
+        return HookRegistry.get_or_create(module).get_hook(SequentialOffloadHook._HOOK_NAME).offload_targets
+
+    assert targets(text_encoder) == [vae]
+    assert targets(vae) == [text_encoder]
+    assert targets(dit) == [text_encoder, vae]
+    remove_sequential_offload([dit, text_encoder, vae])
 
 
 def test_sequential_offload_rejects_explicit_hsdp_dit_selection() -> None:

@@ -213,7 +213,8 @@ def apply_sequential_offload(
         device: Target GPU device for loading
         pin_memory: Whether to pin CPU memory for faster transfers
         use_hsdp: Whether HSDP is enabled. HSDP-sharded DiTs stay resident (an
-            explicit offload_dit_modules selection raises) and transfers are blocking.
+            explicit offload_dit_modules selection raises), the selected stages
+            start on the host and evict each other, and transfers are blocking.
         offload_initial_dits: Whether to begin with all DiT modules on CPU.
         offload_dit_modules: DiT modules allowed to move to CPU. None selects
             every DiT for backward compatibility.
@@ -252,6 +253,12 @@ def apply_sequential_offload(
 
     all_modules = [*dit_modules, *encoder_modules]
     initial_devices = _capture_tensor_devices(dit_modules) if offload_initial_dits else []
+    # HSDP keeps the DiTs resident, so no DiT hook evicts the stages before
+    # their first use: start the selected stages on the host instead.
+    host_stages = (
+        [module for module in encoder_modules if id(module) in selected_encoder_ids] if use_hsdp else []
+    )
+    initial_devices += _capture_tensor_devices(host_stages)
     try:
         selected_encoders = [encoder for encoder in encoder_modules if id(encoder) in selected_encoder_ids]
         # Register hooks on DiT modules (offload selected encoders and other selected DiTs).
@@ -274,8 +281,11 @@ def apply_sequential_offload(
         selected_dits = [dit for dit in dit_modules if id(dit) in selected_dit_ids]
         for enc in encoder_modules:
             registry = HookRegistry.get_or_create(enc)
+            # With the DiTs resident under HSDP nothing else evicts a stage
+            # after use, so the selected stages evict each other.
+            other_stages = [stage for stage in host_stages if stage is not enc]
             hook = SequentialOffloadHook(
-                offload_targets=selected_dits,
+                offload_targets=selected_dits + other_stages,
                 device=device,
                 pin_memory=pin_memory,
                 use_hsdp=use_hsdp,
@@ -289,6 +299,8 @@ def apply_sequential_offload(
                 if id(dit_mod) not in selected_dit_ids:
                     continue
                 _get_sequential_offload_hook(dit_mod)._to_cpu(dit_mod)
+        for stage in host_stages:
+            _get_sequential_offload_hook(stage)._to_cpu(stage)
     except BaseException:
         try:
             remove_sequential_offload(all_modules)
