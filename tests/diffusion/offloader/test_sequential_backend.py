@@ -427,6 +427,24 @@ def test_sequential_offload_keeps_hsdp_dit_resident(monkeypatch: pytest.MonkeyPa
     remove_sequential_offload([dit, encoder])
 
 
+def test_sequential_offload_rejects_explicit_hsdp_dit_selection() -> None:
+    dit = _create_simple_module()
+    encoder = _create_simple_module()
+
+    with pytest.raises(ValueError, match="HSDP-sharded DiT"):
+        apply_sequential_offload(
+            dit_modules=[dit],
+            encoder_modules=[encoder],
+            device=torch.device("cpu"),
+            use_hsdp=True,
+            offload_dit_modules=[dit],
+        )
+
+    assert getattr(dit, "_hook_registry", None) is None or dit._hook_registry.get_hook(
+        SequentialOffloadHook._HOOK_NAME
+    ) is None
+
+
 def test_direct_component_activation_failure_still_offloads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
