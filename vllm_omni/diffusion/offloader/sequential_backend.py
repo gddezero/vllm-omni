@@ -10,6 +10,7 @@ from torch.distributed._tensor import DTensor  # type: ignore[attr-defined]
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
+from vllm_omni.diffusion.utils.tensor_move import replace_tensor_data
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig, SupportsModelCpuOffload
@@ -50,7 +51,7 @@ def _restore_tensor_devices(devices: list[tuple[torch.Tensor, torch.device]]) ->
     for tensor, device in devices:
         try:
             if tensor.device != device:
-                tensor.data = tensor.data.to(device)
+                replace_tensor_data(tensor, tensor.data.to(device))
         except BaseException as exc:
             logger.exception("Failed to restore tensor placement to %s", device)
             first_error = first_error or exc
@@ -121,14 +122,14 @@ class SequentialOffloadHook(ModelHook):
                 data = p.data.to(target_device, non_blocking=non_blocking)
                 if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
                     data = data.pin_memory()
-                p.data = data
+                replace_tensor_data(p, data)
                 moved = True
         for b in module.buffers():
             if b.device != target_device:
                 data = b.data.to(target_device, non_blocking=non_blocking)
                 if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
                     data = data.pin_memory()
-                b.data = data
+                replace_tensor_data(b, data)
                 moved = True
         return moved
 
