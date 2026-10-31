@@ -229,6 +229,17 @@ def test_move_params_handles_buffer_only_modules() -> None:
     assert module.state.device.type == "cpu"
 
 
+def test_hook_device_without_index_is_the_current_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    # TPU reports the worker device as torch.device("tpu") while tensors sit on
+    # tpu:0; device objects need no backend, so cuda stands in here.
+    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda *a, **k: torch.device("cuda"))
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 1)
+
+    assert SequentialOffloadHook([], torch.device("cuda")).device == torch.device("cuda", 1)
+    assert SequentialOffloadHook([], torch.device("cuda", 0)).device == torch.device("cuda", 0)
+    assert SequentialOffloadHook([], torch.device("cpu")).device == torch.device("cpu")
+
+
 # CPU and meta tensors are not shallow-copy compatible, like a CPU tensor and an
 # out-of-tree device tensor (e.g. TPU), so meta stands in for such a device here.
 def test_move_params_swaps_incompatible_tensor_types() -> None:

@@ -20,6 +20,20 @@ from .plan_resolver import resolve_offload_plan
 logger = init_logger(__name__)
 
 
+def _with_index(device: torch.device) -> torch.device:
+    """``device`` with an index: an accelerator device without one is the current device.
+
+    Some platforms report the worker device without an index (TPU:
+    ``torch.device("tpu")``) while tensors sit on ``tpu:0``; with the index
+    resolved, ``tensor.device != self.device`` recognizes resident tensors.
+    """
+    device = torch.device(device)
+    accelerator = torch.accelerator.current_accelerator()
+    if device.index is None and accelerator is not None and device.type == accelerator.type:
+        return torch.device(device.type, torch.accelerator.current_device_index())
+    return device
+
+
 def _capture_tensor_devices(modules: Collection[nn.Module]) -> list[tuple[torch.Tensor, torch.device]]:
     seen: set[int] = set()
     devices: list[tuple[torch.Tensor, torch.device]] = []
@@ -66,7 +80,7 @@ class SequentialOffloadHook(ModelHook):
     ):
         # Modules to offload to CPU before this module runs
         self.offload_targets = offload_targets
-        self.device = device
+        self.device = _with_index(device)
         self.pin_memory = pin_memory
         self.use_hsdp = use_hsdp
         self.offload_after_context = offload_after_context
