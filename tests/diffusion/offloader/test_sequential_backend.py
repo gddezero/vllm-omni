@@ -473,6 +473,28 @@ def test_sequential_offload_keeps_hsdp_dit_resident(monkeypatch: pytest.MonkeyPa
     remove_sequential_offload([dit, encoder])
 
 
+def test_sequential_offload_hsdp_stages_evict_each_other(monkeypatch: pytest.MonkeyPatch) -> None:
+    dit = _create_simple_module()
+    text_encoder = _create_simple_module()
+    vae = _create_simple_module()
+    monkeypatch.setattr(SequentialOffloadHook, "_to_cpu", lambda self, module: None)
+
+    apply_sequential_offload(
+        dit_modules=[dit],
+        encoder_modules=[text_encoder, vae],
+        device=torch.device("cpu"),
+        use_hsdp=True,
+    )
+
+    def targets(module: nn.Module) -> list[nn.Module]:
+        return HookRegistry.get_or_create(module).get_hook(SequentialOffloadHook._HOOK_NAME).offload_targets
+
+    assert targets(text_encoder) == [vae]
+    assert targets(vae) == [text_encoder]
+    assert targets(dit) == [text_encoder, vae]
+    remove_sequential_offload([dit, text_encoder, vae])
+
+
 def test_sequential_offload_rejects_explicit_hsdp_dit_selection() -> None:
     dit = _create_simple_module()
     encoder = _create_simple_module()

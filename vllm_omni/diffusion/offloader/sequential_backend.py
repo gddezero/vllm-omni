@@ -214,7 +214,7 @@ def apply_sequential_offload(
         pin_memory: Whether to pin CPU memory for faster transfers
         use_hsdp: Whether HSDP is enabled. HSDP-sharded DiTs stay resident (an
             explicit offload_dit_modules selection raises), the selected stages
-            start on the host, and transfers are blocking.
+            start on the host and evict each other, and transfers are blocking.
         offload_initial_dits: Whether to begin with all DiT modules on CPU.
         offload_dit_modules: DiT modules allowed to move to CPU. None selects
             every DiT for backward compatibility.
@@ -281,8 +281,11 @@ def apply_sequential_offload(
         selected_dits = [dit for dit in dit_modules if id(dit) in selected_dit_ids]
         for enc in encoder_modules:
             registry = HookRegistry.get_or_create(enc)
+            # With the DiTs resident under HSDP nothing else evicts a stage
+            # after use, so the selected stages evict each other.
+            other_stages = [stage for stage in host_stages if stage is not enc]
             hook = SequentialOffloadHook(
-                offload_targets=selected_dits,
+                offload_targets=selected_dits + other_stages,
                 device=device,
                 pin_memory=pin_memory,
                 use_hsdp=use_hsdp,
