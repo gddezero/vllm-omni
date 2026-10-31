@@ -465,7 +465,9 @@ def test_sequential_offload_keeps_hsdp_dit_resident(monkeypatch: pytest.MonkeyPa
 
     dit_hook = HookRegistry.get_or_create(dit).get_hook(SequentialOffloadHook._HOOK_NAME)
     encoder_hook = HookRegistry.get_or_create(encoder).get_hook(SequentialOffloadHook._HOOK_NAME)
-    assert offloaded == []
+    # The DiT stays on the device; the stage starts on the host because no
+    # DiT hook will evict it before its first use.
+    assert offloaded == [encoder]
     assert dit_hook.offload_targets == [encoder] and not dit_hook.offload_after_context
     assert encoder_hook.offload_targets == [] and encoder_hook.offload_after_context
     remove_sequential_offload([dit, encoder])
