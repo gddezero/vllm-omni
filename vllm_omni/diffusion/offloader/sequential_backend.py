@@ -212,7 +212,8 @@ def apply_sequential_offload(
         encoder_modules: Encoder modules to register hooks on
         device: Target GPU device for loading
         pin_memory: Whether to pin CPU memory for faster transfers
-        use_hsdp: Whether HSDP is enabled (affects non_blocking behavior)
+        use_hsdp: Whether HSDP is enabled. HSDP-sharded DiTs stay resident (an
+            explicit offload_dit_modules selection raises) and transfers are blocking.
         offload_initial_dits: Whether to begin with all DiT modules on CPU.
         offload_dit_modules: DiT modules allowed to move to CPU. None selects
             every DiT for backward compatibility.
@@ -232,6 +233,19 @@ def apply_sequential_offload(
         >>> # Modules of pipeline now automatically swap between CPU and GPU
     """
     selected_dit_ids = {id(module) for module in (dit_modules if offload_dit_modules is None else offload_dit_modules)}
+    if use_hsdp and selected_dit_ids:
+        # FSDP2 all-gathers from its own sharded storage and re-reads the
+        # parameters only in nn.Module._apply / load_state_dict. Moving HSDP
+        # parameters one by one therefore frees no device memory, and moving
+        # them back adds a second device copy. HSDP already shards the DiT;
+        # keep it resident and offload the other components.
+        if offload_dit_modules is not None:
+            raise ValueError(
+                "Model-level offload cannot move HSDP-sharded DiT modules; "
+                "remove the DiT from the selected offload components"
+            )
+        logger.info("HSDP: model-level offload keeps the DiT modules resident")
+        selected_dit_ids = set()
     selected_encoder_ids = {
         id(module) for module in (encoder_modules if offload_encoder_modules is None else offload_encoder_modules)
     }

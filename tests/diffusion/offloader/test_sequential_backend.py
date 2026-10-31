@@ -445,6 +445,50 @@ def test_sequential_offload_can_begin_with_dit_on_cpu(monkeypatch: pytest.Monkey
     remove_sequential_offload([dit, encoder])
 
 
+def test_sequential_offload_keeps_hsdp_dit_resident(monkeypatch: pytest.MonkeyPatch) -> None:
+    dit = _create_simple_module()
+    encoder = _create_simple_module()
+    offloaded: list[nn.Module] = []
+    monkeypatch.setattr(
+        SequentialOffloadHook,
+        "_to_cpu",
+        lambda self, module: offloaded.append(module),
+    )
+
+    apply_sequential_offload(
+        dit_modules=[dit],
+        encoder_modules=[encoder],
+        device=torch.device("cpu"),
+        use_hsdp=True,
+        offload_initial_dits=True,
+    )
+
+    dit_hook = HookRegistry.get_or_create(dit).get_hook(SequentialOffloadHook._HOOK_NAME)
+    encoder_hook = HookRegistry.get_or_create(encoder).get_hook(SequentialOffloadHook._HOOK_NAME)
+    assert offloaded == []
+    assert dit_hook.offload_targets == [encoder] and not dit_hook.offload_after_context
+    assert encoder_hook.offload_targets == [] and encoder_hook.offload_after_context
+    remove_sequential_offload([dit, encoder])
+
+
+def test_sequential_offload_rejects_explicit_hsdp_dit_selection() -> None:
+    dit = _create_simple_module()
+    encoder = _create_simple_module()
+
+    with pytest.raises(ValueError, match="HSDP-sharded DiT"):
+        apply_sequential_offload(
+            dit_modules=[dit],
+            encoder_modules=[encoder],
+            device=torch.device("cpu"),
+            use_hsdp=True,
+            offload_dit_modules=[dit],
+        )
+
+    assert getattr(dit, "_hook_registry", None) is None or dit._hook_registry.get_hook(
+        SequentialOffloadHook._HOOK_NAME
+    ) is None
+
+
 def test_direct_component_activation_failure_still_offloads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
