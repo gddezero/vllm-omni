@@ -246,6 +246,22 @@ def test_move_params_swaps_incompatible_tensor_types() -> None:
     assert module.scale.device.type == "meta"
 
 
+class _TaggedBuffer(torch.Tensor):
+    pass
+
+
+def test_move_params_swap_keeps_buffer_class_and_attributes() -> None:
+    module = nn.Module()
+    module.register_buffer("table", torch.ones(3).as_subclass(_TaggedBuffer))
+    table = module.table
+    table.quant_meta = "meta-info"
+
+    assert SequentialOffloadHook._move_params(module, torch.device("meta"))
+
+    assert module.table is table and type(table) is _TaggedBuffer
+    assert table.quant_meta == "meta-info" and table.device.type == "meta"
+
+
 def test_model_level_backend_keeps_declared_image_encoder_resident() -> None:
     class MixedEncoderPipeline(nn.Module):
         _offload_plan = OffloadPlan(
