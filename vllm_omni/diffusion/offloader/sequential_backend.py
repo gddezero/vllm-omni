@@ -19,6 +19,16 @@ from .plan_resolver import resolve_offload_plan
 logger = init_logger(__name__)
 
 
+def _is_on(device: torch.device, target: torch.device) -> bool:
+    """Whether ``device`` is ``target``; a target without an index is the current device of its type.
+
+    Some platforms report the worker device without an index (TPU:
+    ``torch.device("tpu")``) while tensors sit on ``tpu:0``, so a plain ``!=``
+    would treat every resident tensor as misplaced and copy it on every forward.
+    """
+    return device.type == target.type and (target.index is None or device.index == target.index)
+
+
 def _capture_tensor_devices(modules: Collection[nn.Module]) -> list[tuple[torch.Tensor, torch.device]]:
     seen: set[int] = set()
     devices: list[tuple[torch.Tensor, torch.device]] = []
@@ -103,14 +113,14 @@ class SequentialOffloadHook(ModelHook):
         """
         moved = False
         for p in module.parameters():
-            if p.data.device != target_device:
+            if not _is_on(p.data.device, target_device):
                 data = p.data.to(target_device, non_blocking=non_blocking)
                 if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
                     data = data.pin_memory()
                 p.data = data
                 moved = True
         for b in module.buffers():
-            if b.device != target_device:
+            if not _is_on(b.device, target_device):
                 data = b.data.to(target_device, non_blocking=non_blocking)
                 if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
                     data = data.pin_memory()
