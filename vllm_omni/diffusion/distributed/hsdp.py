@@ -20,6 +20,7 @@ from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+from vllm_omni.diffusion.utils.tensor_move import parameter_like
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -32,17 +33,6 @@ def _unshardable_parameters(model: nn.Module) -> set[nn.Parameter]:
         for param in model.parameters()
         if param.ndim == 0 or not (param.is_floating_point() or param.is_complex())
     }
-
-
-def _parameter_like(template: nn.Parameter, tensor: torch.Tensor) -> nn.Parameter:
-    """A Parameter of the template's class and metadata wrapping ``tensor``."""
-    if type(template) is nn.Parameter:
-        replacement = nn.Parameter(tensor, requires_grad=template.requires_grad)
-    else:
-        replacement = template.__class__.__new__(template.__class__, tensor)
-        replacement.requires_grad_(template.requires_grad)
-    replacement.__dict__.update(getattr(template, "__dict__", {}))
-    return replacement
 
 
 def _move_tensor_in_place(tensor: torch.Tensor, device: torch.device) -> None:
@@ -60,7 +50,7 @@ def _move_tensor_in_place(tensor: torch.Tensor, device: torch.device) -> None:
         tensor.data = moved
         return
     if isinstance(tensor, nn.Parameter):
-        moved = _parameter_like(tensor, moved)
+        moved = parameter_like(tensor, moved)
     torch.utils.swap_tensors(tensor, moved)
 
 

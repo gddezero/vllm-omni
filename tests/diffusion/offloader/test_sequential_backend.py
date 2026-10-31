@@ -229,6 +229,23 @@ def test_move_params_handles_buffer_only_modules() -> None:
     assert module.state.device.type == "cpu"
 
 
+# CPU and meta tensors are not shallow-copy compatible, like a CPU tensor and an
+# out-of-tree device tensor (e.g. TPU), so meta stands in for such a device here.
+def test_move_params_swaps_incompatible_tensor_types() -> None:
+    module = _create_simple_module()
+    module.register_buffer("scale", torch.ones(2))
+    weight = module.linear.weight
+    weight.weight_loader = "loader"
+    with pytest.raises(RuntimeError, match="incompatible tensor type"):
+        nn.Parameter(torch.ones(2)).data = torch.ones(2, device="meta")
+
+    assert SequentialOffloadHook._move_params(module, torch.device("meta"))
+
+    assert module.linear.weight is weight and weight.weight_loader == "loader"
+    assert isinstance(weight, nn.Parameter) and weight.device.type == "meta"
+    assert module.scale.device.type == "meta"
+
+
 def test_model_level_backend_keeps_declared_image_encoder_resident() -> None:
     class MixedEncoderPipeline(nn.Module):
         _offload_plan = OffloadPlan(
