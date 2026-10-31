@@ -13,7 +13,6 @@ from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.offloader.sequential_backend import (
     ModelLevelOffloadBackend,
     SequentialOffloadHook,
-    _is_on,
     apply_sequential_offload,
     remove_sequential_offload,
     sequential_offload_component,
@@ -230,14 +229,15 @@ def test_move_params_handles_buffer_only_modules() -> None:
     assert module.state.device.type == "cpu"
 
 
-def test_target_device_without_index_matches_current_device_tensors() -> None:
+def test_hook_device_without_index_is_the_current_device(monkeypatch: pytest.MonkeyPatch) -> None:
     # TPU reports the worker device as torch.device("tpu") while tensors sit on
     # tpu:0; device objects need no backend, so cuda stands in here.
-    assert _is_on(torch.device("cuda", 0), torch.device("cuda"))
-    assert _is_on(torch.device("cuda", 1), torch.device("cuda", 1))
-    assert not _is_on(torch.device("cuda", 0), torch.device("cuda", 1))
-    assert not _is_on(torch.device("cpu"), torch.device("cuda"))
-    assert _is_on(torch.device("cpu"), torch.device("cpu"))
+    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda *a, **k: torch.device("cuda"))
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 1)
+
+    assert SequentialOffloadHook([], torch.device("cuda")).device == torch.device("cuda", 1)
+    assert SequentialOffloadHook([], torch.device("cuda", 0)).device == torch.device("cuda", 0)
+    assert SequentialOffloadHook([], torch.device("cpu")).device == torch.device("cpu")
 
 
 def test_model_level_backend_keeps_declared_image_encoder_resident() -> None:

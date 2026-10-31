@@ -19,14 +19,18 @@ from .plan_resolver import resolve_offload_plan
 logger = init_logger(__name__)
 
 
-def _is_on(device: torch.device, target: torch.device) -> bool:
-    """Whether ``device`` is ``target``; a target without an index is the current device of its type.
+def _with_index(device: torch.device) -> torch.device:
+    """``device`` with an index: an accelerator device without one is the current device.
 
     Some platforms report the worker device without an index (TPU:
-    ``torch.device("tpu")``) while tensors sit on ``tpu:0``, so a plain ``!=``
-    would treat every resident tensor as misplaced and copy it on every forward.
+    ``torch.device("tpu")``) while tensors sit on ``tpu:0``; with the index
+    resolved, ``tensor.device != self.device`` recognizes resident tensors.
     """
-    return device.type == target.type and (target.index is None or device.index == target.index)
+    device = torch.device(device)
+    accelerator = torch.accelerator.current_accelerator()
+    if device.index is None and accelerator is not None and device.type == accelerator.type:
+        return torch.device(device.type, torch.accelerator.current_device_index())
+    return device
 
 
 def _capture_tensor_devices(modules: Collection[nn.Module]) -> list[tuple[torch.Tensor, torch.device]]:
@@ -75,7 +79,7 @@ class SequentialOffloadHook(ModelHook):
     ):
         # Modules to offload to CPU before this module runs
         self.offload_targets = offload_targets
-        self.device = device
+        self.device = _with_index(device)
         self.pin_memory = pin_memory
         self.use_hsdp = use_hsdp
         self.offload_after_context = offload_after_context
@@ -113,14 +117,14 @@ class SequentialOffloadHook(ModelHook):
         """
         moved = False
         for p in module.parameters():
-            if not _is_on(p.data.device, target_device):
+            if p.data.device != target_device:
                 data = p.data.to(target_device, non_blocking=non_blocking)
                 if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
                     data = data.pin_memory()
                 p.data = data
                 moved = True
         for b in module.buffers():
-            if not _is_on(b.device, target_device):
+            if b.device != target_device:
                 data = b.data.to(target_device, non_blocking=non_blocking)
                 if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
                     data = data.pin_memory()
