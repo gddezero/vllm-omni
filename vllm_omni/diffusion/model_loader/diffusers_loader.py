@@ -1169,12 +1169,14 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     and isinstance(quant_method, UnquantizedLinearMethod)
                     and _postload_on_host_enabled()
                 ):
-                    # Unquantized dense processing is pure tensor reshaping (stock vLLM: a
-                    # no-op off CPU/XPU; vllm-torchtpu: a one-time transpose to (k, n)),
-                    # so it gives the same values on the host. Doing it there skips a
-                    # host -> device -> host round trip of every dense weight, which every
-                    # rank pays in parallel at startup when weights load on the host
-                    # (CPU offload / HSDP full load).
+                    # Unquantized dense post-load processing does not depend on where the
+                    # weight lives: stock vLLM's UnquantizedLinearMethod only acts on CPU/XPU
+                    # platforms (a no-op on out-of-tree accelerators such as TPU, which is
+                    # what diffusion models get with quant_config=None), and subclasses only
+                    # reshape the tensor. Running it on the host skips a host -> device ->
+                    # host round trip of every dense weight, which every rank pays in
+                    # parallel at startup when weights load on the host (CPU offload / HSDP
+                    # full load).
                     quant_method.process_weights_after_loading(module)
                     continue
 
