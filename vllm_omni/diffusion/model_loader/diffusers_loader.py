@@ -180,6 +180,14 @@ class _PreShardedHSDPLoadPlan:
     binding_names: frozenset[str]
 
 
+def _postload_on_host_enabled() -> bool:
+    """VLLM_OMNI_POSTLOAD_ON_HOST=1: run unquantized dense post-load processing on the host.
+
+    Off by default while it is being measured (R056); see ``_process_weights_after_loading``.
+    """
+    return os.environ.get("VLLM_OMNI_POSTLOAD_ON_HOST", "0") == "1"
+
+
 class DiffusersPipelineLoader(HWRLoaderMixin):
     """Model loader that can load diffusers pipeline components from disk."""
 
@@ -1153,6 +1161,22 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 if module_device is not None:
                     module_device = module_device.device
                 needs_device_move = module_device != target_device
+
+                if (
+                    needs_device_move
+                    and module_device is not None
+                    and module_device.type == "cpu"
+                    and isinstance(quant_method, UnquantizedLinearMethod)
+                    and _postload_on_host_enabled()
+                ):
+                    # Unquantized dense processing is pure tensor reshaping (stock vLLM: a
+                    # no-op off CPU/XPU; vllm-torchtpu: a one-time transpose to (k, n)),
+                    # so it gives the same values on the host. Doing it there skips a
+                    # host -> device -> host round trip of every dense weight, which every
+                    # rank pays in parallel at startup when weights load on the host
+                    # (CPU offload / HSDP full load).
+                    quant_method.process_weights_after_loading(module)
+                    continue
 
                 if needs_device_move:
                     module.to(target_device)
