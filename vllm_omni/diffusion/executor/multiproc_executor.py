@@ -381,8 +381,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         num_gpus = cast(int, od_config.num_gpus)
         # Without this, every worker inherits one Torch thread per core, so an
         # N-GPU run oversubscribes the host by N x core_count. Honours a
-        # user-provided OMP_NUM_THREADS.
-        set_multiprocessing_worker_envs()
+        # user-provided OMP_NUM_THREADS. Pass the local worker count: the default
+        # (1) hands every worker the full core count, which is the oversubscription
+        # this call exists to prevent (vLLM's own executor passes num_local_procs).
+        set_multiprocessing_worker_envs(num_gpus)
         mp.set_start_method("spawn", force=True)
         processes = []
 
