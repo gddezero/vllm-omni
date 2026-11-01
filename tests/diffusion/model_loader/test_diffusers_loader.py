@@ -860,14 +860,15 @@ def test_unquantized_postload_runs_on_host_only_when_enabled(monkeypatch, enable
     monkeypatch.setattr(loader_module.DiffusersPipelineLoader, "_has_online_quant", lambda self, m: False)
 
     loader = _make_loader_with_weights([])
-    loader._process_weights_after_loading(model, torch.device("tpu", 0))
+    loader._process_weights_after_loading(model, torch.device("meta"))
 
     # Same values either way; only the host -> device -> host round trip differs.
+    # ("meta" stands in for the accelerator: any non-CPU target triggers the move; the stub .to() never moves.)
     assert torch.equal(model.layer.weight, expected)
     if enabled:
         assert model.layer.to_calls == []
     else:
-        assert model.layer.to_calls == [torch.device("tpu", 0), torch.device("cpu")]
+        assert model.layer.to_calls == [torch.device("meta"), torch.device("cpu")]
 
 
 def test_host_postload_leaves_other_quant_methods_on_round_trip(monkeypatch):
@@ -881,10 +882,10 @@ def test_host_postload_leaves_other_quant_methods_on_round_trip(monkeypatch):
     monkeypatch.setattr(loader_module.DiffusersPipelineLoader, "_has_online_quant", lambda self, m: False)
 
     loader = _make_loader_with_weights([])
-    loader._process_weights_after_loading(model, torch.device("tpu", 0))
+    loader._process_weights_after_loading(model, torch.device("meta"))
 
     quant_method.process_weights_after_loading.assert_called_once_with(model.layer)
-    assert model.layer.to_calls == [torch.device("tpu", 0), torch.device("cpu")]
+    assert model.layer.to_calls == [torch.device("meta"), torch.device("cpu")]
 
 
 class _ConfigAwareModel(nn.Module):
