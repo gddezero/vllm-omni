@@ -92,6 +92,9 @@ def _place_states_fsdp_cannot_move(
         _move_tensor_in_place(tensor, device)
 
 
+_host_shard_logged = [False]
+
+
 def _host_shard_enabled() -> bool:
     """Opt-in (``VLLM_OMNI_HSDP_HOST_SHARD=1``): cut each rank's shard on the host instead of moving whole states."""
     return os.environ.get("VLLM_OMNI_HSDP_HOST_SHARD") == "1"
@@ -111,7 +114,7 @@ def _host_shard_dtensor(full: torch.Tensor, meta_param: DTensor, device: torch.d
     local_shape, offset = compute_local_shape_and_global_offset(full.shape, mesh, placements)
     local = full[tuple(slice(o, o + n) for o, n in zip(offset, local_shape, strict=True))]
     local = local.to(device=device, dtype=meta_param.dtype).contiguous()
-    return DTensor.from_local(local, mesh, placements, run_check=False, shape=full.shape, stride=full.stride())
+    return DTensor.from_local(local, mesh, placements, run_check=False, shape=meta_param.shape, stride=meta_param.stride())
 
 
 def _fully_shard_from_host(module: nn.Module, kwargs: dict[str, Any]) -> None:
@@ -151,17 +154,18 @@ def _fully_shard_from_host(module: nn.Module, kwargs: dict[str, Any]) -> None:
         for name, param in module.named_parameters(remove_duplicate=False)
         if id(param) in primary and primary[id(param)] != name
     ]
+    swapped = list(host)
     meta = torch.device("meta")
     for param in params:
         if not isinstance(param, DTensor) and param.device.type == "cpu":
             _move_tensor_in_place(param, meta)
     for buf in buffers:
-        if buf.device != device and buf.device.type != "meta":
+        if buf.device != device and buf.device.type != "meta" and not isinstance(buf, DTensor):
             _move_tensor_in_place(buf, device)
     fully_shard(module, **kwargs)
     sharded: dict[str, torch.Tensor] = {}
     for name, param in module.named_parameters():
-        full = host.get(name)
+        full = host.pop(name, None)  # drop the host reference as soon as its shard is cut
         if full is None:
             continue
         if not isinstance(param, DTensor):
@@ -173,7 +177,9 @@ def _fully_shard_from_host(module: nn.Module, kwargs: dict[str, Any]) -> None:
     for alias, name in aliases:
         owner, _, attr = alias.rpartition(".")
         (module.get_submodule(owner) if owner else module)._parameters[attr] = module.get_parameter(name)
-    left = [n for n, t in itertools.chain(module.named_parameters(), module.named_buffers()) if t.device.type == "meta"]
+    # Only the parameters this call swapped to meta must be back on the device;
+    # states that were already on meta (e.g. a pre-sharded load) are not ours.
+    left = [n for n in swapped if module.get_parameter(n).device.type == "meta"]
     if left:
         raise RuntimeError(f"HSDP host shard left meta tensors: {left[:5]} (+{max(0, len(left) - 5)})")
 
@@ -182,8 +188,14 @@ def _fully_shard_placing(module: nn.Module, kwargs: dict[str, Any]) -> None:
     """``fully_shard`` with the state placement the current device needs."""
     mesh = kwargs.get("mesh")
     if mesh is not None and _fsdp_cannot_move_from_cpu(mesh.device_type) and _host_shard_enabled():
-        _fully_shard_from_host(module, kwargs)
-        return
+        # Only worth it (and only defined) for modules whose parameters load on the host;
+        # e.g. a pre-sharded load leaves them on meta for FSDP2 to materialize.
+        if any(not isinstance(p, DTensor) and p.device.type == "cpu" for p in module.parameters()):
+            if not _host_shard_logged[0]:
+                logger.info("HSDP: cutting each rank's shard on the host (VLLM_OMNI_HSDP_HOST_SHARD=1)")
+                _host_shard_logged[0] = True
+            _fully_shard_from_host(module, kwargs)
+            return
     _place_states_fsdp_cannot_move(module, mesh, kwargs.get("ignored_params"))
     fully_shard(module, **kwargs)
 
