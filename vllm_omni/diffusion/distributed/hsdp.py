@@ -3,6 +3,7 @@
 
 import functools
 import itertools
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -89,6 +90,102 @@ def _place_states_fsdp_cannot_move(
         if tensor.device == device or tensor.device.type == "meta" or isinstance(tensor, DTensor):
             continue
         _move_tensor_in_place(tensor, device)
+
+
+def _host_shard_enabled() -> bool:
+    """Opt-in (``VLLM_OMNI_HSDP_HOST_SHARD=1``): cut each rank's shard on the host instead of moving whole states."""
+    return os.environ.get("VLLM_OMNI_HSDP_HOST_SHARD") == "1"
+
+
+def _host_shard_dtensor(full: torch.Tensor, meta_param: DTensor, device: torch.device) -> DTensor:
+    """This rank's shard of ``full`` (a host tensor) as a DTensor on ``device``.
+
+    The local shape and offset come from DTensor's own rule, the same one
+    FSDP2 uses when it chunks a full parameter, so the shard equals what
+    ``fully_shard`` would have produced from the whole tensor on the device.
+    Only the shard is copied to the device.
+    """
+    from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+
+    mesh, placements = meta_param.device_mesh, meta_param.placements
+    local_shape, offset = compute_local_shape_and_global_offset(full.shape, mesh, placements)
+    local = full[tuple(slice(o, o + n) for o, n in zip(offset, local_shape, strict=True))]
+    local = local.to(device=device, dtype=meta_param.dtype).contiguous()
+    return DTensor.from_local(local, mesh, placements, run_check=False, shape=full.shape, stride=full.stride())
+
+
+def _fully_shard_from_host(module: nn.Module, kwargs: dict[str, Any]) -> None:
+    """``fully_shard(module)`` without first copying whole host parameters to the device.
+
+    The default path (``_place_states_fsdp_cannot_move``) moves every managed
+    parameter to the device at full size and lets FSDP2 chunk it there, so each
+    rank transfers the whole module. Here the managed host parameters are
+    swapped to ``meta`` (keeping a reference to their host data), FSDP2 builds
+    its sharded parameters on ``meta``, and each rank then loads only its own
+    shard, cut on the host, with ``load_state_dict(assign=True)`` (FSDP2 resets
+    its sharded storage from assigned parameters at lazy init). Buffers are not
+    sharded and are moved whole, as before.
+    """
+    from torch.distributed.fsdp._fully_shard._fsdp_init import (
+        _get_device_from_mesh,
+        _get_managed_modules,
+        _get_managed_states,
+    )
+
+    mesh = kwargs["mesh"]
+    ignored_params = kwargs.get("ignored_params")
+    device = _get_device_from_mesh(mesh)
+    params, buffers = _get_managed_states(_get_managed_modules((module,), ignored_params), ignored_params)
+    managed = {id(p) for p in params}
+    # One entry per parameter object, under the name named_parameters() reports
+    # first; other names of a tied parameter are re-pointed at it after loading
+    # (assigning each name separately would untie them).
+    host: dict[str, torch.Tensor] = {}
+    primary: dict[int, str] = {}
+    for name, param in module.named_parameters():
+        if id(param) in managed and not isinstance(param, DTensor) and param.device.type == "cpu":
+            host[name] = param.detach()
+            primary[id(param)] = name
+    aliases = [
+        (name, primary[id(param)])
+        for name, param in module.named_parameters(remove_duplicate=False)
+        if id(param) in primary and primary[id(param)] != name
+    ]
+    meta = torch.device("meta")
+    for param in params:
+        if not isinstance(param, DTensor) and param.device.type == "cpu":
+            _move_tensor_in_place(param, meta)
+    for buf in buffers:
+        if buf.device != device and buf.device.type != "meta":
+            _move_tensor_in_place(buf, device)
+    fully_shard(module, **kwargs)
+    sharded: dict[str, torch.Tensor] = {}
+    for name, param in module.named_parameters():
+        full = host.get(name)
+        if full is None:
+            continue
+        if not isinstance(param, DTensor):
+            raise RuntimeError(f"HSDP host shard: {name} is not an FSDP2 DTensor after fully_shard")
+        sharded[name] = _host_shard_dtensor(full, param, device)
+    result = module.load_state_dict(sharded, strict=False, assign=True)
+    if result.unexpected_keys:
+        raise RuntimeError(f"HSDP host shard: unexpected keys {result.unexpected_keys}")
+    for alias, name in aliases:
+        owner, _, attr = alias.rpartition(".")
+        (module.get_submodule(owner) if owner else module)._parameters[attr] = module.get_parameter(name)
+    left = [n for n, t in itertools.chain(module.named_parameters(), module.named_buffers()) if t.device.type == "meta"]
+    if left:
+        raise RuntimeError(f"HSDP host shard left meta tensors: {left[:5]} (+{max(0, len(left) - 5)})")
+
+
+def _fully_shard_placing(module: nn.Module, kwargs: dict[str, Any]) -> None:
+    """``fully_shard`` with the state placement the current device needs."""
+    mesh = kwargs.get("mesh")
+    if mesh is not None and _fsdp_cannot_move_from_cpu(mesh.device_type) and _host_shard_enabled():
+        _fully_shard_from_host(module, kwargs)
+        return
+    _place_states_fsdp_cannot_move(module, mesh, kwargs.get("ignored_params"))
+    fully_shard(module, **kwargs)
 
 
 @dataclass
@@ -351,8 +448,7 @@ def shard_hsdp_module(module: nn.Module, context: HSDPShardContext) -> None:
         module_ignored_params = context.ignored_params.intersection(module.parameters())
         if module_ignored_params:
             module_kwargs["ignored_params"] = module_ignored_params
-    _place_states_fsdp_cannot_move(module, module_kwargs.get("mesh"), module_kwargs.get("ignored_params"))
-    fully_shard(module, **module_kwargs)
+    _fully_shard_placing(module, module_kwargs)
     for param in module.parameters():
         param.requires_grad = False
 
@@ -362,8 +458,7 @@ def finalize_hsdp_root(model: nn.Module, context: HSDPShardContext) -> None:
     root_kwargs = dict(context.hsdp_kwargs)
     if context.ignored_params:
         root_kwargs["ignored_params"] = context.ignored_params
-    _place_states_fsdp_cannot_move(model, root_kwargs.get("mesh"), root_kwargs.get("ignored_params"))
-    fully_shard(model, **root_kwargs)
+    _fully_shard_placing(model, root_kwargs)
     for param in model.parameters():
         param.requires_grad = False
 
