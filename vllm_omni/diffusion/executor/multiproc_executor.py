@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import json
 import multiprocessing as mp
 import multiprocessing.connection
@@ -13,7 +14,7 @@ import threading
 import time
 import weakref
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from multiprocessing.synchronize import Event
 from typing import TYPE_CHECKING, Any, cast
@@ -36,6 +37,37 @@ from vllm_omni.diffusion.offloader.config import (
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
 from vllm_omni.diffusion.worker import WorkerProc
+
+@contextlib.contextmanager
+def _worker_thread_env(num_local_workers: int) -> Iterator[None]:
+    """Size worker Torch threads by the local worker count, for the spawns inside the block only.
+
+    ``set_multiprocessing_worker_envs`` writes OMP_NUM_THREADS into this
+    process's environment (spawned workers read it when they start) and also
+    sets this process's own Torch thread count. Both are restored on exit, so
+    the value does not leak to later executors or stages started from this
+    process (vLLM's helper returns early once OMP_NUM_THREADS is present) and
+    the parent keeps its thread count. A user-provided OMP_NUM_THREADS is
+    honoured by the helper and left as it was.
+    """
+    import torch
+
+    keys = ("OMP_NUM_THREADS", "VLLM_OMP_NUM_THREADS_SET_BY_VLLM")
+    saved_env = {k: os.environ.get(k) for k in keys}
+    saved_threads = torch.get_num_threads()
+    # Pass the local worker count: the default (1) hands every worker the full
+    # core count, i.e. N x core_count threads on an N-worker host.
+    set_multiprocessing_worker_envs(num_local_workers)
+    try:
+        yield
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        if torch.get_num_threads() != saved_threads:
+            torch.set_num_threads(saved_threads)
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
@@ -379,12 +411,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         logger.info("Starting server...")
 
         num_gpus = cast(int, od_config.num_gpus)
-        # Without this, every worker inherits one Torch thread per core, so an
-        # N-GPU run oversubscribes the host by N x core_count. Honours a
-        # user-provided OMP_NUM_THREADS. Pass the local worker count: the default
-        # (1) hands every worker the full core count, which is the oversubscription
-        # this call exists to prevent (vLLM's own executor passes num_local_procs).
-        set_multiprocessing_worker_envs(num_gpus)
         mp.set_start_method("spawn", force=True)
         processes = []
 
@@ -396,26 +422,29 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         scheduler_pipe_readers = []
         scheduler_pipe_writers = []
 
-        for i in range(num_gpus):
-            reader, writer = mp.Pipe(duplex=False)
-            scheduler_pipe_writers.append(writer)
-            process = mp.Process(
-                target=WorkerProc.worker_main,
-                args=(
-                    i,  # rank
-                    od_config,
-                    writer,
-                    broadcast_handle,
-                    wake_events[i],
-                    worker_extension_cls,
-                    custom_pipeline_args,
-                ),
-                name=f"DiffusionWorker-{i}",
-                daemon=True,
-            )
-            scheduler_pipe_readers.append(reader)
-            process.start()
-            processes.append(process)
+        # Without the thread env every worker inherits one Torch thread per core,
+        # so an N-worker run oversubscribes the host by N x core_count.
+        with _worker_thread_env(num_gpus):
+            for i in range(num_gpus):
+                reader, writer = mp.Pipe(duplex=False)
+                scheduler_pipe_writers.append(writer)
+                process = mp.Process(
+                    target=WorkerProc.worker_main,
+                    args=(
+                        i,  # rank
+                        od_config,
+                        writer,
+                        broadcast_handle,
+                        wake_events[i],
+                        worker_extension_cls,
+                        custom_pipeline_args,
+                    ),
+                    name=f"DiffusionWorker-{i}",
+                    daemon=True,
+                )
+                scheduler_pipe_readers.append(reader)
+                process.start()
+                processes.append(process)
 
         # Wait for all workers to be ready
         result_handles: list[Handle] = []
