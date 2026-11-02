@@ -822,6 +822,107 @@ def test_process_weights_skips_completed_online_quant_layer(monkeypatch):
     assert model.layer.to_calls == []
 
 
+def _host_postload_model(quant_method, *, meta_buffer=False):
+    class _NoMoveLinear(nn.Linear):
+        """Records .to() calls without moving, so the test runs on CPU-only hosts."""
+
+        def __init__(self):
+            super().__init__(3, 2, bias=False)
+            self.to_calls: list[object] = []
+
+        def to(self, *args, **kwargs):
+            self.to_calls.append(args[0] if args else kwargs.get("device"))
+            return self
+
+    model = nn.Module()
+    model.layer = _NoMoveLinear()
+    if meta_buffer:
+        # One state off the host: the module needs the whole-module move to unify devices.
+        model.layer.register_buffer("scale", torch.empty(1, device="meta"))
+    model.layer.quant_method = quant_method
+    return model
+
+
+@pytest.fixture
+def stock_postload_calls(monkeypatch):
+    """Record calls to the stock UnquantizedLinearMethod post-load (with the weight's device at call time)."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    calls = []
+    monkeypatch.setattr(
+        UnquantizedLinearMethod,
+        "process_weights_after_loading",
+        lambda self, layer: calls.append((type(self), layer.weight.device)),
+    )
+    monkeypatch.setattr(loader_module.DiffusersPipelineLoader, "_has_online_quant", lambda self, m: False)
+    return calls
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_stock_unquantized_postload_runs_on_host_only_when_enabled(monkeypatch, stock_postload_calls, enabled):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    model = _host_postload_model(UnquantizedLinearMethod())
+    monkeypatch.setenv("VLLM_OMNI_POSTLOAD_ON_HOST", "1" if enabled else "0")
+
+    _make_loader_with_weights([])._process_weights_after_loading(model, torch.device("meta"))
+
+    # Called exactly once either way; only the host -> device -> host round trip differs.
+    # ("meta" stands in for the accelerator: any non-CPU target triggers the move; the stub .to() never moves.)
+    assert stock_postload_calls == [(UnquantizedLinearMethod, torch.device("cpu"))]
+    if enabled:
+        assert model.layer.to_calls == []
+    else:
+        assert model.layer.to_calls == [torch.device("meta"), torch.device("cpu")]
+
+
+def test_host_postload_unset_env_keeps_round_trip(monkeypatch, stock_postload_calls):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    monkeypatch.delenv("VLLM_OMNI_POSTLOAD_ON_HOST", raising=False)
+    model = _host_postload_model(UnquantizedLinearMethod())
+    _make_loader_with_weights([])._process_weights_after_loading(model, torch.device("meta"))
+    assert model.layer.to_calls == [torch.device("meta"), torch.device("cpu")]
+
+
+def test_host_postload_keeps_round_trip_for_subclasses(monkeypatch, stock_postload_calls):
+    """A subclass may post-process with device ops (e.g. a platform format cast): only the exact stock type skips the move."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    subclass = type("_DeviceDependentUnquantized", (UnquantizedLinearMethod,), {})
+    model = _host_postload_model(subclass())
+    monkeypatch.setenv("VLLM_OMNI_POSTLOAD_ON_HOST", "1")
+    _make_loader_with_weights([])._process_weights_after_loading(model, torch.device("meta"))
+    assert stock_postload_calls == [(subclass, torch.device("cpu"))]
+    assert model.layer.to_calls == [torch.device("meta"), torch.device("cpu")]
+
+
+def test_host_postload_keeps_round_trip_for_mixed_device_modules(monkeypatch, stock_postload_calls):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    model = _host_postload_model(UnquantizedLinearMethod(), meta_buffer=True)
+    monkeypatch.setenv("VLLM_OMNI_POSTLOAD_ON_HOST", "1")
+    _make_loader_with_weights([])._process_weights_after_loading(model, torch.device("meta"))
+    assert model.layer.to_calls == [torch.device("meta"), torch.device("cpu")]
+
+
+def test_host_postload_leaves_other_quant_methods_on_round_trip(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+
+    quant_method = Mock(spec=QuantizeMethodBase)
+    model = _host_postload_model(quant_method)
+    monkeypatch.setenv("VLLM_OMNI_POSTLOAD_ON_HOST", "1")
+    monkeypatch.setattr(loader_module.DiffusersPipelineLoader, "_has_online_quant", lambda self, m: False)
+
+    loader = _make_loader_with_weights([])
+    loader._process_weights_after_loading(model, torch.device("meta"))
+
+    quant_method.process_weights_after_loading.assert_called_once_with(model.layer)
+    assert model.layer.to_calls == [torch.device("meta"), torch.device("cpu")]
+
+
 class _ConfigAwareModel(nn.Module):
     def __init__(self, *, od_config):
         super().__init__()

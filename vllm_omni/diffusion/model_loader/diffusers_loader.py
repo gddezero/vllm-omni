@@ -5,6 +5,7 @@ import dataclasses
 import fnmatch
 import glob
 import json
+import itertools
 import os
 import re
 import time
@@ -178,6 +179,14 @@ class _PreShardedHSDPLoadPlan:
     groups: list[_HSDPModuleLoadGroup]
     bindings: dict[str, TensorBinding]
     binding_names: frozenset[str]
+
+
+def _postload_on_host_enabled() -> bool:
+    """VLLM_OMNI_POSTLOAD_ON_HOST=1: run unquantized dense post-load processing on the host.
+
+    Off by default; see ``_process_weights_after_loading``.
+    """
+    return os.environ.get("VLLM_OMNI_POSTLOAD_ON_HOST", "0") == "1"
 
 
 class DiffusersPipelineLoader(HWRLoaderMixin):
@@ -1112,6 +1121,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             # have none, so passing None is safe here.
             finalize_layerwise_processing(model, model_config=None)
 
+        postload_on_host = _postload_on_host_enabled()
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is None or not isinstance(quant_method, QuantizeMethodBase):
@@ -1153,6 +1163,26 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 if module_device is not None:
                     module_device = module_device.device
                 needs_device_move = module_device != target_device
+
+                if (
+                    postload_on_host
+                    and needs_device_move
+                    # Exactly the stock method (as _process_pre_sharded_hsdp_groups_on_meta
+                    # requires): subclasses may post-process with device ops (e.g. a
+                    # platform format cast), which must keep the round trip.
+                    and type(quant_method) is UnquantizedLinearMethod
+                    # Every state on the host, not just the first parameter: a module
+                    # with mixed devices still needs the whole-module move to unify it.
+                    and all(t.device.type == "cpu" for t in itertools.chain(module.parameters(), module.buffers()))
+                ):
+                    # Stock vLLM UnquantizedLinearMethod.process_weights_after_loading only
+                    # acts on CPU/XPU platforms; on out-of-tree accelerators (TPU), which is
+                    # what diffusion linears get with quant_config=None, it is a no-op. The
+                    # host -> device -> host round trip around it is pure transfer, paid by
+                    # every rank in parallel at startup when weights load on the host (CPU
+                    # offload / HSDP full load). Call it where the weights already are.
+                    quant_method.process_weights_after_loading(module)
+                    continue
 
                 if needs_device_move:
                     module.to(target_device)
